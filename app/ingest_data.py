@@ -38,8 +38,9 @@ CHUNKS_PATH = os.path.join(OUTPUT_DIR, "chunks.json")
 
 def load_all_pdfs(data_dir: str) -> tuple[str, int]:
     """Extract and merge all text from all PDFs in a directory."""
-    from pypdf import PdfReader
+    import pdfplumber
     import glob
+    import unicodedata
 
     pdf_files = glob.glob(os.path.join(data_dir, "*.pdf"))
     if not pdf_files:
@@ -48,15 +49,22 @@ def load_all_pdfs(data_dir: str) -> tuple[str, int]:
 
     print(f"📄 Found {len(pdf_files)} PDF(s) in {data_dir}")
     
+    def clean_arabic_text(text: str) -> str:
+        # 1. Reverse each line because RTL text was extracted LTR visually
+        lines = text.split('\n')
+        reversed_text = '\n'.join([line[::-1] for line in lines])
+        # 2. Normalize presentation forms to standard Arabic codepoints
+        return unicodedata.normalize('NFKC', reversed_text)
+
     combined_text = ""
     for pdf_path in pdf_files:
         print(f"📄 Processing: {os.path.basename(pdf_path)}")
         try:
-            reader = PdfReader(pdf_path)
-            for i, page in enumerate(reader.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    combined_text += page_text + "\n"
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        combined_text += clean_arabic_text(page_text) + "\n"
         except Exception as e:
             print(f"❌ Error processing {pdf_path}: {e}")
 

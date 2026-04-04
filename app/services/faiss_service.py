@@ -76,7 +76,7 @@ class FAISSService:
             self.chunks = None
             return False
 
-    def search(self, query_embedding: list[float], top_k: int = 3) -> list[str]:
+    def search(self, query_embedding: list[float], top_k: int = 15) -> list[str]:
         """
         Search the FAISS index for the most similar chunks.
 
