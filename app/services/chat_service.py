@@ -20,19 +20,16 @@ MAX_HISTORY = 5
 FALLBACK_RESPONSE = "أعتذر، لا أملك معلومات كافية للإجابة على هذا السؤال حالياً."
 
 # System prompt — Arabic support agent persona
-SYSTEM_PROMPT = """أنت مساعد ذكي ومحترف، خبير في تحليل المستندات. مهمتك الأساسية هي الإجابة على أسئلة المستخدم بناءً على [السياق المرفق] فقط.
+SYSTEM_PROMPT = """أنت مساعد ذكي ومحترف، خبير في تحليل المستندات المتخصصة والردود الفنية. 
+مهمتك الأساسية هي الإجابة على أسئلة المستخدم بذكاء.
 
 التعليمات الأساسية:
-1. الفهم الذكي (المرونة): اقرأ السياق جيداً. حاول فهم نية المستخدم الحقيقية من السؤال حتى لو استخدم مرادفات مختلفة، أو لهجة عامية، أو أخطأ إملائياً.
-ملاحظة هامة جداً: بعض النصوص في المرفق قد تكون معكوسة الحروف أو ترتيب الكلمات بسبب خطأ في الاستخراج التقني (مثال: قد تجد "ﻒﻟﺎﺨﻣ نﻼﻋإ ﻲﻐﻟأ ﻒﯿﻛ" وهي تعني "كيف ألغي إعلان مخالف"). يرجى قراءة النص بذكاء وفك تشفيره عند الحاجة واستخراج المعنى الحقيقي.
-2. الدقة الصارمة (منع الهلوسة): اعتمد حصرياً على المعلومات الموجودة في السياق. يُمنع منعاً باتاً تأليف، أو استنتاج، أو جلب أي معلومات من معرفتك العامة خارج المستند.
-3. طريقة العرض: اجعل إجابتك مباشرة، واضحة، ومنسقة (استخدم النقاط إذا كانت الإجابة عبارة عن خطوات أو شروط).
-4. التعامل مع غياب المعلومة: إذا سأل المستخدم عن شيء غير موجود نهائياً في السياق المرفق، لا تحاول التخمين. أجب بوضوح وأدب قائلاً: "عذراً، لا تتوفر معلومات حول هذا الموضوع في المستند الحالي."
-
-[السياق المرفق]:
-{context}
+1. الفهم الذكي والاستنتاج المرن: اقرأ سؤال المستخدم بتمعن. يجب أن تفهم نية المستخدم الحقيقية حتى لو كان سؤاله بلهجة عامية، أو احتوى على أخطاء إملائية، أو استخدم مرادفات غير دقيقة. تعامل مع هذه الأخطاء بذكاء لتقديم الإجابة المناسبة من السياق.
+2. التعامل مع مشاكل التنقيب الآلي: بعض النصوص في السياق المرفق قد تكون معكوسة الحروف أو ترتيب الكلمات نتيجة الاستخراج من ملف PDF (مثال: قد تجد "ﻒﻟﺎﺨﻣ نﻼﻋإ ﻲﻐﻟأ ﻒﯿﻛ" بدلاً من "كيف ألغي إعلان مخالف"). عليك قراءة النص، فك تشفيره ذهنياً، واستخراج المعنى الحقيقي.
+3. الاعتماد المشدد على السياق (مكافحة الهلوسة): اعتمد في إجابتك على المعلومات المتوفرة في السياق المعطى في رسالة المستخدم. إذا لم تكن هناك معلومات كافية، فحاول الاستنتاج المنطقي المباشر من السياق المتاح. يُمنع منعاً باتاً تأليف معلومات من خارج السياق.
+4. غياب المعلومة: في حال كان السؤال بعيداً كلياً عن السياق المتوفر ولا يمكن الإجابة عليه إطلاقًا، يمكنك الاعتذار بشكل مهذب وبطريقتك الخاصة قائلاً أنه لا توجد تفاصيل دقيقة حول هذا الموضوع في المستندات المتوفرة لديك، بدلاً من استخدام رد نمطي جامد.
+5. طريقة العرض: اجعل إجاباتك مباشرة، واضحة، سهلة القراءة. استخدم النقاط إذا استدعى الأمر.
 """
-
 
 def _get_history(user_id: str) -> list[dict]:
     """Get conversation history for a user, creating if needed."""
@@ -65,48 +62,62 @@ async def process_chat(message: str, user_id: str = "anonymous") -> str:
     try:
         # Step 1: Get query embedding
         try:
+            logger.info(f"[{user_id}] Generating embedding for user query...")
             query_embedding = await openai_service.get_embedding(message)
         except Exception as e:
-            logger.error(f"Failed to get embedding for query: {e}")
+            logger.error(f"[{user_id}] Failed to get embedding for query: {e}")
             return FALLBACK_RESPONSE
 
         # Step 2: Search FAISS for relevant chunks
-        relevant_chunks = faiss_service.search(query_embedding, top_k=3)
+        logger.info(f"[{user_id}] Searching FAISS for relevant chunks (top_k=10)...")
+        relevant_chunks = faiss_service.search(query_embedding, top_k=10)
+        
+        # We always create context even if empty. The LLM can handle it intelligently.
+        if relevant_chunks:
+            context = "\n\n---\n\n".join(relevant_chunks)
+            logger.info(f"[{user_id}] Retrieved {len(relevant_chunks)} chunks. Context length: {len(context)} chars")
+            # Log a small preview of the context for debugging
+            logger.debug(f"[{user_id}] Context preview: {context[:200]}...")
+        else:
+            logger.warning(f"[{user_id}] No relevant chunks found in FAISS.")
+            context = "لا تتوفر أي نصوص أو سياق إضافي للإجابة على هذا السؤال."
 
-        if not relevant_chunks:
-            logger.warning("No relevant chunks found — using fallback")
-            return FALLBACK_RESPONSE
+        # Step 3: Build user message incorporating the retrieved context
+        user_prompt_content = f"""بناءً على هذا السياق المستخرج من المستندات الأساسية:
+{context}
 
-        # Step 3: Build context from retrieved chunks
-        context = "\n\n---\n\n".join(relevant_chunks)
+---
+سؤال المستخدم:
+{message}"""
 
-        # Step 4: Build messages list
+        # Step 4: Build messages list (System -> History -> User)
         system_message = {
             "role": "system",
-            "content": SYSTEM_PROMPT.format(context=context)
+            "content": SYSTEM_PROMPT
         }
 
-        # Get user's conversation history
         history = _get_history(user_id)
 
         messages = [system_message] + history + [
-            {"role": "user", "content": message}
+            {"role": "user", "content": user_prompt_content}
         ]
 
         # Step 5: Call GPT-4o-mini
         try:
+            logger.info(f"[{user_id}] Sending payload to GPT-4o-mini...")
             response = await openai_service.get_chat_response(messages)
         except Exception as e:
-            logger.error(f"Failed to get chat response: {e}")
+            logger.error(f"[{user_id}] Failed to get chat response: {e}")
             return FALLBACK_RESPONSE
 
         # Step 6: Update conversation history
+        # Note: We only add the strict user 'message' to history to prevent giant context from inflating token usage across turns
         _add_to_history(user_id, "user", message)
         _add_to_history(user_id, "assistant", response)
 
-        logger.info(f"Chat processed for user '{user_id}': {len(response)} chars")
+        logger.info(f"[{user_id}] Chat processed successfully: {len(response)} chars returned")
         return response
 
     except Exception as e:
-        logger.error(f"Unexpected error in chat processing: {e}")
+        logger.error(f"[{user_id}] Unexpected error in chat processing: {e}")
         return FALLBACK_RESPONSE
