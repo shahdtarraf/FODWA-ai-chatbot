@@ -1,17 +1,31 @@
+"""
+Real endpoint test — starts Django server and sends a test query.
+"""
+
 import urllib.request
 import json
 import sys
 import subprocess
 import time
+import os
 
 def test_query():
-    print("Starting temporary test server...")
-    proc = subprocess.Popen(["uvicorn", "app.main:app", "--port", "10001"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    time.sleep(4)
+    print("Starting temporary Django test server...")
+    env = os.environ.copy()
+    env["DJANGO_SETTINGS_MODULE"] = "fodwa_project.settings"
+    proc = subprocess.Popen(
+        [sys.executable, "manage.py", "runserver", "10001", "--noreload"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env
+    )
+    time.sleep(5)
     
     try:
         if proc.poll() is not None:
+            stdout, stderr = proc.communicate()
             print("Server failed to start")
+            print(stderr.decode())
             sys.exit(1)
             
         print("Sending request: 'كيف يمكنني إلغاء إعلان مخالف؟'")

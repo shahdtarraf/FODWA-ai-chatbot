@@ -1,13 +1,26 @@
+"""
+Backend integration test for the Django version.
+Starts django dev server, tests GET / and POST /chat.
+"""
+
 import subprocess
 import time
 import urllib.request
 import json
 import sys
+import os
 
 def run_tests():
-    print("Starting uvicorn server...")
-    proc = subprocess.Popen(["uvicorn", "app.main:app", "--port", "10000"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    time.sleep(4) # Wait for server to start
+    print("Starting Django development server...")
+    env = os.environ.copy()
+    env["DJANGO_SETTINGS_MODULE"] = "fodwa_project.settings"
+    proc = subprocess.Popen(
+        [sys.executable, "manage.py", "runserver", "10000", "--noreload"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env
+    )
+    time.sleep(5)  # Wait for server to start
 
     try:
         # Check if process died

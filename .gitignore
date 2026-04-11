@@ -3,3 +3,9 @@
 *.pyc
 .env.test
 .DS_Store
+db.sqlite3
+staticfiles/
+*.egg-info/
+dist/
+build/
+.sixth/

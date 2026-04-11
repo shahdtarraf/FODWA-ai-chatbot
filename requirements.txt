@@ -1,11 +1,20 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
+# === Django & REST Framework ===
+django>=4.2,<5.0
+djangorestframework>=3.14
+django-cors-headers>=4.3
+gunicorn>=21.2
+whitenoise>=6.5
+
+# === AI / Vector Search ===
 faiss-cpu==1.8.0.post1
 openai>=1.60.0
+numpy==1.26.2
+
+# === Auth & Config ===
 pyjwt==2.8.0
 python-dotenv==1.0.0
-numpy==1.26.2
 
 # === Ingestion only (local) ===
 langchain-text-splitters==0.0.2
 PyMuPDF
+pdfplumber
