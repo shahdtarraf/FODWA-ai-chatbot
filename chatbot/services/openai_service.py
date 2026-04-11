@@ -64,7 +64,7 @@ def get_chat_response(messages: list[dict]) -> str:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            temperature=0.3,
+            temperature=0.4,
             max_tokens=1024
         )
         content = response.choices[0].message.content.strip()
