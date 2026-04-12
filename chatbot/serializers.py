@@ -13,5 +13,5 @@ class ChatRequestSerializer(serializers.Serializer):
 
 class ChatResponseSerializer(serializers.Serializer):
     """Chat endpoint response body."""
-    response = serializers.CharField()
+    response = serializers.DictField()
     user_id = serializers.CharField(allow_null=True)

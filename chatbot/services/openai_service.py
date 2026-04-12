@@ -65,7 +65,8 @@ def get_chat_response(messages: list[dict]) -> str:
             model="gpt-4o",
             messages=messages,
             temperature=0.4,
-            max_tokens=1024
+            max_tokens=1024,
+            response_format={ "type": "json_object" }
         )
         content = response.choices[0].message.content.strip()
         logger.info(f"Chat response received: {len(content)} chars")

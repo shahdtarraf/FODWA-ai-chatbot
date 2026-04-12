@@ -9,6 +9,7 @@ import logging
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from django.http import JsonResponse
 
 from chatbot.serializers import ChatRequestSerializer, ChatResponseSerializer
 from chatbot.auth.jwt_handler import decode_token
@@ -70,11 +71,11 @@ class ChatView(APIView):
             response_serializer = ChatResponseSerializer(data=response_data)
             response_serializer.is_valid()
 
-            return Response(response_serializer.data)
+            return JsonResponse(response_serializer.data, json_dumps_params={'ensure_ascii': False})
 
         except Exception as e:
             logger.error(f"Chat endpoint error: {e}")
-            return Response({
-                "response": "أعتذر، حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.",
+            return JsonResponse({
+                "response": {"answer": "أعتذر، حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.", "steps": [], "tips": []},
                 "user_id": "anonymous",
-            })
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR, json_dumps_params={'ensure_ascii': False})
