@@ -22,38 +22,40 @@ MAX_HISTORY = 5
 # Arabic fallback response
 FALLBACK_RESPONSE = "لا أملك معلومات كافية حالياً، يرجى التواصل مع فريق الدعم"
 
-# System prompt — Arabic support agent persona
-SYSTEM_PROMPT = """أنت مساعد ذكي ومحترف، خبير في تحليل المستندات المتخصصة والردود الفنية. 
-مهمتك الأساسية هي الإجابة على أسئلة المستخدم بذكاء. تعامل بلهجة ودية واحترافية.
+SYSTEM_PROMPT = """أنت مساعد ذكي ومحترف، خبير في دعم العملاء والإجابة الفنية بالاعتماد على المستندات.
+مهمتك الأساسية هي الإجابة بذكاء وبطريقة طبيعية ومريحة للقراءة.
 
-التعليمات الأساسية:
-• الإجابة باللغة العربية فقط: لا تستخدم أي لغة أخرى.
-• طريقة العرض والتنسيق: يجب أن يكون الرد بتنسيق JSON حصراً.
+التعليمات الأساسية (STRICT RULES):
+1. ابدأ دائمًا باللغة العربية أولاً.
+2. أضف خط فاصل:
+   ---
+3. اكتب نفس الإجابة باللغة الإنجليزية.
+4. لا تدمج العربية والإنجليزية في نفس الجملة أبداً.
+5. لا تبدأ باللغة الإنجليزية أبداً.
 
-شكل الرد المطلوب (JSON format ONLY):
-{
-  "answer": "فقرة الإجابة الرئيسية أو الترحيب",
-  "steps": [
-    "الخطوة الأولى",
-    "الخطوة الثانية"
-  ],
-  "tips": [
-    "ملاحظة أو نصيحة إضافية"
-  ]
-}
+هيكل الرد المطلوب (RESPONSE STRUCTURE):
+- ابدأ بإجابة عربية واضحة وطبيعية.
+- إذا كانت الإجابة تتطلب خطوات (Steps)، استخدم التنسيق التالي وبشكل طبيعي:
+  أولاً، ...
+  ثانياً، ...
+  ثالثاً، ...
+- إذا لم تحتج الإجابة لخطوات، اكتف بتقديم فقرة نصية واضحة ومباشرة.
+- بعد الخط الفاصل (---)، كرر نفس المنطق باللغة الإنجليزية (الإجابة + الخطوات إن وجدت فقط).
+
+ممنوعات قطعية (DO NOT):
+- لا تقم بتضمين أي هياكل برمجية أو JSON نهائياً (بدون Arrays أو Objects).
+- لا تجبر إضافة خطوات إذا لم تكن ضرورية للإجابة بشكل منطقي.
+- لا تبرز رموزاً برمجية مثل \\n وغيرها، اكتب النص بشكل طبيعي.
+- لا تكن روبوتياً في أسلوبك، اجعل نبرتك احترافية وطبيعية.
 
 ملاحظات هامة:
-• إذا لم تكن هناك خطوات، اترك المصفوفة "steps" فارغة [].
-• إذا لم تكن هناك نصائح، اترك المصفوفة "tips" فارغة [].
-• الفهم الذكي والاستنتاج: افهم نية المستخدم الحقيقية، حتى مع الأخطاء الإملائية أو اللهجات العامة.
-• التعامل مع مشاكل التنقيب: فك تشفير الكلمات المعكوسة الناتجة عن استخراج النصوص.
-• مكافحة الهلوسة: اعتمد بشكل مشدد على السياق المرفق. يُمنع تأليف المعلومات من خارج المستندات.
-• غياب المعلومات: إذا كان السؤال خارج السياق ولا تملك معلومات كافية، أرجع الـ JSON التالي:
-{
-  "answer": "لا أملك معلومات كافية حالياً، يرجى التواصل مع فريق الدعم",
-  "steps": [],
-  "tips": []
-}
+- حافظ على الروابط والأسماء صحيحة.
+- الفهم الذكي والاستنتاج: افهم نية المستخدم الحقيقية، حتى مع الأخطاء الإملائية.
+- مكافحة الهلوسة: اعتمد بشكل مشدد على السياق المرفق. يُمنع تأليف المعلومات من خارج المستندات.
+- غياب المعلومات: إذا كان السؤال خارج السياق ولا تملك معلومات كافية، التزم بالرد التالي:
+"لا أملك معلومات كافية حالياً، يرجى التواصل مع فريق الدعم"
+---
+"I currently do not have enough information, please contact the support team."
 """
 
 def _get_history(user_id: str) -> list[dict]:
@@ -73,7 +75,7 @@ def _add_to_history(user_id: str, role: str, content: str):
         _conversation_history[user_id] = history[-(MAX_HISTORY * 2):]
 
 
-def process_chat(message: str, user_id: str = "anonymous") -> dict:
+def process_chat(message: str, user_id: str = "anonymous") -> str:
     """
     Process a user chat message through the RAG pipeline.
 
@@ -82,7 +84,7 @@ def process_chat(message: str, user_id: str = "anonymous") -> dict:
         user_id: User identifier from JWT.
 
     Returns:
-        Dictionary containing the structured Arabic response.
+        String containing the bilingual Arabic/English response.
     """
     try:
         # Step 1: Get query embedding
@@ -91,7 +93,7 @@ def process_chat(message: str, user_id: str = "anonymous") -> dict:
             query_embedding = openai_service.get_embedding(message)
         except Exception as e:
             logger.error(f"[{user_id}] Failed to get embedding for query: {e}")
-            return {"answer": FALLBACK_RESPONSE, "steps": [], "tips": []}
+            return FALLBACK_RESPONSE
 
         # Step 2: Search FAISS for relevant chunks
         logger.info(f"[{user_id}] Searching FAISS for relevant chunks (top_k=10)...")
@@ -133,24 +135,16 @@ def process_chat(message: str, user_id: str = "anonymous") -> dict:
             response = openai_service.get_chat_response(messages)
         except Exception as e:
             logger.error(f"[{user_id}] Failed to get chat response: {e}")
-            return {"answer": FALLBACK_RESPONSE, "steps": [], "tips": []}
+            return FALLBACK_RESPONSE
 
         # Step 6: Update conversation history
-        # Try to parse the JSON response safely
-        import json
-        try:
-            response_data = json.loads(response)
-        except json.JSONDecodeError:
-            response_data = {"answer": response, "steps": [], "tips": []}
-
         # Note: We only add the strict user 'message' to history to prevent giant context from inflating token usage across turns
         _add_to_history(user_id, "user", message)
-        # Store as stringified JSON in history for the assistant
         _add_to_history(user_id, "assistant", response)
 
         logger.info(f"[{user_id}] Chat processed successfully: {len(response)} chars returned")
-        return response_data
+        return response
 
     except Exception as e:
         logger.error(f"[{user_id}] Unexpected error in chat processing: {e}")
-        return {"answer": FALLBACK_RESPONSE, "steps": [], "tips": []}
+        return FALLBACK_RESPONSE

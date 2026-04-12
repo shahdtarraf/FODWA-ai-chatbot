@@ -76,6 +76,6 @@ class ChatView(APIView):
         except Exception as e:
             logger.error(f"Chat endpoint error: {e}")
             return JsonResponse({
-                "response": {"answer": "أعتذر، حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.", "steps": [], "tips": []},
+                "response": "أعتذر، حدث خطأ أثناء معالجة طلبك. يرجى المحاولة مرة أخرى.",
                 "user_id": "anonymous",
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR, json_dumps_params={'ensure_ascii': False})
