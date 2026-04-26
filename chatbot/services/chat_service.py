@@ -161,16 +161,18 @@ def process_chat(message: str, user_id: str = "anonymous") -> str:
 
         # ── NLP Pre-processing ───────────────────────────────────────────────
         # Runs BEFORE any FAISS or LLM call.
-        # Returns: NLPMetadata(language, dialect, intent)
+        # Returns: NLPMetadata with language/dialect/intent + confidence scores
         nlp = preprocess(message, history)
+        # Structured log: lang=ar(0.92) dialect=egyptian(0.81) intent=rephrase(0.95)
+        dialect_log = f"dialect={nlp.dialect}({nlp.dialect_confidence:.2f}) " if nlp.dialect else ""
         logger.info(
-            f"[{user_id}] NLP | lang={nlp.language!r} "
-            f"dialect={nlp.dialect!r} intent={nlp.intent!r}"
+            f"[{user_id}] [NLP] lang={nlp.language}({nlp.lang_confidence:.2f}) "
+            f"{dialect_log}intent={nlp.intent}({nlp.intent_confidence:.2f})"
         )
 
         # ── Router: Rephrase path ────────────────────────────────────────────
         if nlp.intent == "rephrase_request":
-            logger.info(f"[{user_id}] Router → rephrase_request: bypassing FAISS entirely")
+            logger.info(f"[{user_id}] [Router] decision=rephrase_request → bypass FAISS")
 
             # Find the last assistant message from history
             last_assistant_msg = None
@@ -193,11 +195,14 @@ def process_chat(message: str, user_id: str = "anonymous") -> str:
                     f"User request: {message}"
                 )
 
-                # Build dynamic system prompt (base + rephrase instructions)
+                # Build dynamic system prompt (base + rephrase instructions + confidence)
                 dynamic_instructions = build_dynamic_system_prompt(
                     lang=nlp.language,
                     dialect=nlp.dialect,
                     intent="rephrase_request",
+                    lang_conf=nlp.lang_confidence,
+                    dialect_conf=nlp.dialect_confidence,
+                    intent_conf=nlp.intent_confidence,
                 )
                 full_system_content = BASE_SYSTEM_PROMPT + "\n\n" + dynamic_instructions
 
@@ -227,7 +232,7 @@ def process_chat(message: str, user_id: str = "anonymous") -> str:
                 return response
 
         # ── Router: New question path (default) ─────────────────────────────
-        logger.info(f"[{user_id}] Router → new_question: executing FAISS search")
+        logger.info(f"[{user_id}] [Router] decision=new_question → FAISS search")
 
         # Step 1: Get query embedding
         try:
@@ -262,11 +267,14 @@ def process_chat(message: str, user_id: str = "anonymous") -> str:
             f"---\nUser Question / سؤال المستخدم:\n{message}"
         )
 
-        # Step 4: Build dynamic system prompt (base + new_question instructions)
+        # Step 4: Build dynamic system prompt (base + new_question instructions + confidence)
         dynamic_instructions = build_dynamic_system_prompt(
             lang=nlp.language,
             dialect=nlp.dialect,
             intent="new_question",
+            lang_conf=nlp.lang_confidence,
+            dialect_conf=nlp.dialect_confidence,
+            intent_conf=nlp.intent_confidence,
         )
         full_system_content = BASE_SYSTEM_PROMPT + "\n\n" + dynamic_instructions
 

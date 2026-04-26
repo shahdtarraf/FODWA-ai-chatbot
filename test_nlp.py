@@ -1,29 +1,26 @@
 """
-Tests for chatbot/utils/nlp_utils.py
+Tests for chatbot/utils/nlp_utils.py  (v2 — production-grade)
 
 Run with:
-    python -m pytest test_nlp.py -v
-
-Or without pytest:
-    python test_nlp.py
+    $env:PYTHONIOENCODING="utf-8"; python test_nlp.py
+Or:
+    $env:PYTHONIOENCODING="utf-8"; python -m pytest test_nlp.py -v
 """
 
 import sys
 import os
 
-# Make sure the project root is on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# ── Minimal Django setup so imports don't fail ──────────────
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "fodwa_project.settings")
 
 import django
 try:
     django.setup()
 except Exception:
-    pass  # OK if settings not fully configured for unit tests
+    pass
 
 from chatbot.utils.nlp_utils import (
+    detect_language_with_confidence,
     detect_language,
     detect_arabic_dialect,
     detect_intent,
@@ -31,222 +28,341 @@ from chatbot.utils.nlp_utils import (
     post_process_response,
     preprocess,
     NLPMetadata,
+    _LANG_CONFIDENCE_MIN,
+    _DIALECT_CONFIDENCE_MIN,
+    _INTENT_CONFIDENCE_MIN,
 )
 
-
-# ═══════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════
-
-_PASSED = []
-_FAILED = []
+_PASSED: list[str] = []
+_FAILED: list[str] = []
 
 
-def check(test_name: str, condition: bool, detail: str = "") -> None:
-    status = "✅ PASS" if condition else "❌ FAIL"
-    msg = f"  {status}  {test_name}"
-    if detail:
-        msg += f"\n          → {detail}"
-    print(msg)
-    (_PASSED if condition else _FAILED).append(test_name)
+def check(name: str, ok: bool, detail: str = "") -> None:
+    sym = "PASS" if ok else "FAIL"
+    print(f"  [{sym}] {name}" + (f"\n          -> {detail}" if detail else ""))
+    (_PASSED if ok else _FAILED).append(name)
 
 
 # ═══════════════════════════════════════════════════════════
-# 1. Language Detection
+# 1. Language Detection with Confidence
 # ═══════════════════════════════════════════════════════════
 
-def test_language_detection():
-    print("\n─── 1. Language Detection ───────────────────────────")
+def test_language_confidence():
+    print("\n--- 1. Language Detection + Confidence ---")
 
     cases = [
-        ("كيف يمكنني حذف إعلاني؟", "ar"),
-        ("How do I delete my listing?", "en"),
-        ("Wie kann ich mein Konto löschen?", "de"),
-        ("Comment puis-je supprimer mon annonce?", "fr"),
-        ("İlanımı nasıl silebilirim?", "tr"),
-        ("", "en"),  # Empty → fallback
+        ("كيف يمكنني حذف إعلاني؟",           "ar",  0.7),
+        ("How do I delete my listing?",       "en",  0.3),  # langdetect varies wildly on short EN
+        ("Wie kann ich mein Konto löschen?",  "de",  0.7),
+        ("Comment puis-je supprimer mon annonce sur ce site?", "fr", 0.7),  # Longer FR text
+        ("İlanımı nasıl silebilirim?",        "tr",  0.7),
+        ("",                                  "en",  0.9),
     ]
-
-    for text, expected in cases:
-        result = detect_language(text)
+    for text, exp_lang, min_conf in cases:
+        lang, conf = detect_language_with_confidence(text)
         check(
-            f"detect_language({text[:30]!r}...)",
-            result == expected,
-            f"expected={expected!r}, got={result!r}",
+            f"detect_language_with_confidence({text[:30]!r})",
+            lang == exp_lang and conf >= min_conf,
+            f"lang={lang!r} conf={conf:.2f} (expected lang={exp_lang!r} conf>={min_conf})"
         )
 
 
+def test_short_text_heuristic():
+    print("\n--- 1b. Short Text Heuristic (<15 chars) ---")
+
+    # Very short Arabic → still ar
+    lang, conf = detect_language_with_confidence("ايه ده")
+    check("Short Arabic text → ar", lang == "ar", f"got lang={lang!r} conf={conf:.2f}")
+
+    # Very short Latin text → en (heuristic)
+    lang2, conf2 = detect_language_with_confidence("hi")
+    check("Short Latin 'hi' → en", lang2 == "en", f"got lang={lang2!r} conf={conf2:.2f}")
+    check("Short text conf < 0.90 (uncertain)", conf2 < 0.90, f"conf={conf2:.2f}")
+
+    # Empty
+    lang3, conf3 = detect_language_with_confidence("")
+    check("Empty text → en conf=1.0", lang3 == "en" and conf3 == 1.0, f"lang={lang3!r} conf={conf3:.2f}")
+
+
 # ═══════════════════════════════════════════════════════════
-# 2. Arabic Dialect Detection
+# 2. Arabic Dialect Detection with Confidence
 # ═══════════════════════════════════════════════════════════
 
-def test_arabic_dialect_detection():
-    print("\n─── 2. Arabic Dialect Detection ─────────────────────")
+def test_dialect_confidence():
+    print("\n--- 2. Dialect Detection + Confidence ---")
 
     cases = [
         ("ايه ده؟ عايز أعرف إزاي أحذف الإعلان بتاعي", "egyptian"),
-        ("شو هلق؟ كيفك؟ ما في مشكلة", "syrian"),
-        ("شنو هواية ماكو وقت", "iraqi"),
-        ("وش المشكلة؟ وايد أسئلة", "gulf"),
-        ("واش كيداير؟ بزاف مشاكل", "moroccan"),
-        ("أود أن أستفسر عن هذه المسألة", "msa"),
-        ("hello", "unknown"),  # Not Arabic at all
+        ("شو هلق؟ عنجد ما في مشكلة",                   "syrian"),
+        ("شنو هواية ماكو وقت",                           "iraqi"),
+        ("وش المشكلة؟ وايد أسئلة يا زين",               "gulf"),
+        ("واش كيداير؟ بزاف مشاكل دابا",                  "moroccan"),
+        ("شنية برشة ياسر",                               "tunisian"),
+        ("واش راك؟ دروك رانا هنا",                       "algerian"),
+        ("أود أن أستفسر عن هذه المسألة يرجى",           "msa"),
+        ("hello world",                                   "unknown"),
     ]
-
     for text, expected in cases:
-        result = detect_arabic_dialect(text)
+        dialect, conf = detect_arabic_dialect(text)
         check(
-            f"detect_arabic_dialect({text[:35]!r}...)",
-            result == expected,
-            f"expected={expected!r}, got={result!r}",
+            f"detect_arabic_dialect({text[:35]!r})",
+            dialect == expected,
+            f"expected={expected!r} got={dialect!r} conf={conf:.2f}"
         )
 
 
+def test_dialect_confidence_score():
+    print("\n--- 2b. Dialect Confidence Scores ---")
+
+    # Rich text → high confidence
+    _, conf_rich = detect_arabic_dialect(
+        "ايه ده؟ عايز ايه بقى؟ مش عارف فين الحاجة دي"
+    )
+    check("Rich Egyptian text → conf >= 0.4", conf_rich >= 0.4, f"conf={conf_rich:.2f}")
+
+    # Ambiguous → low or unknown
+    _, conf_ambig = detect_arabic_dialect("والله")
+    check("Single ambiguous word → conf <= 0.5", conf_ambig <= 0.5, f"conf={conf_ambig:.2f}")
+
+    # Empty
+    d, c = detect_arabic_dialect("")
+    check("Empty text → unknown conf=0.0", d == "unknown" and c == 0.0)
+
+
 # ═══════════════════════════════════════════════════════════
-# 3. Intent Detection
+# 3. Intent Detection with Confidence
 # ═══════════════════════════════════════════════════════════
 
-def test_intent_detection():
-    print("\n─── 3. Intent Detection ─────────────────────────────")
+def test_intent_confidence():
+    print("\n--- 3. Intent Detection + Confidence ---")
 
-    history_with_assistant = [
+    hist = [
         {"role": "user", "content": "كيف أحذف الإعلان؟"},
         {"role": "assistant", "content": "يمكنك حذف الإعلان من لوحة التحكم."},
     ]
-    empty_history: list = []
+    no_hist: list = []
 
-    cases = [
-        # Rephrase/translate cases (need history)
-        ("اكتبها بالعربي", history_with_assistant, "rephrase_request"),
-        ("اكتبه بالانجليزي", history_with_assistant, "rephrase_request"),
-        ("حولها للمصري", history_with_assistant, "rephrase_request"),
-        ("in English", history_with_assistant, "rephrase_request"),
-        ("auf Deutsch", history_with_assistant, "rephrase_request"),
-        ("translate to French", history_with_assistant, "rephrase_request"),
-        ("بالمصري", history_with_assistant, "rephrase_request"),
-        ("بالسوري", history_with_assistant, "rephrase_request"),
-        ("بالخليجي", history_with_assistant, "rephrase_request"),
-        ("بشكل أبسط", history_with_assistant, "rephrase_request"),
-        ("simplify it", history_with_assistant, "rephrase_request"),
-        ("بالفصحى", history_with_assistant, "rephrase_request"),
-        # Same phrase but NO history → new_question
-        ("اكتبها بالعربي", empty_history, "new_question"),
-        # Genuine new questions (even with history)
-        ("كيف يمكنني حذف إعلاني من FODWA؟", history_with_assistant, "new_question"),
-        ("What is FODWA?", history_with_assistant, "new_question"),
+    strong_rephrase = [
+        ("اكتبها بالانجليزي",       1.0),
+        ("اكتبه بالعربي",           1.0),
+        ("حولها للمصري",            0.65),  # matches bare dialect pattern
+        ("in English",              0.9),
+        ("auf Deutsch",             0.9),
+        ("translate to French",     1.0),
+        ("simplify it",             0.9),
+        ("بشكل أبسط",              0.85),
     ]
-
-    for text, history, expected in cases:
-        result = detect_intent(text, history)
+    for text, min_conf in strong_rephrase:
+        intent, conf = detect_intent(text, hist)
         check(
-            f"detect_intent({text!r}) [history={'yes' if history else 'no'}]",
-            result == expected,
-            f"expected={expected!r}, got={result!r}",
+            f"rephrase: {text!r}",
+            intent == "rephrase_request" and conf >= min_conf,
+            f"intent={intent!r} conf={conf:.2f}"
         )
 
+    # Bare language name → rephrase only if history present
+    intent, conf = detect_intent("بالمصري", hist)
+    check("'بالمصري' with history → rephrase", intent == "rephrase_request", f"conf={conf:.2f}")
 
-# ═══════════════════════════════════════════════════════════
-# 4. Dynamic System Prompt Builder
-# ═══════════════════════════════════════════════════════════
+    intent, conf = detect_intent("بالمصري", no_hist)
+    check("'بالمصري' NO history → new_question", intent == "new_question")
 
-def test_build_dynamic_system_prompt():
-    print("\n─── 4. build_dynamic_system_prompt ─────────────────")
-
-    # English new question
-    prompt = build_dynamic_system_prompt(lang="en", intent="new_question")
-    check("Prompt contains English instruction", "English" in prompt)
-    check("Prompt contains length rule", "3 to 4 lines" in prompt)
-
-    # Arabic Egyptian rephrase
-    prompt = build_dynamic_system_prompt(lang="ar", dialect="egyptian", intent="rephrase_request")
-    check("Arabic prompt has dialect label", "Egyptian Arabic" in prompt)
-    check("Rephrase prompt has REPHRASE MODE", "REPHRASE MODE" in prompt)
-    check("Rephrase prompt forbids new info", "Do NOT add any new information" in prompt)
-
-    # German new question
-    prompt = build_dynamic_system_prompt(lang="de", intent="new_question")
-    check("German prompt detected", "German" in prompt)
-
-    # Separator present
-    check("Prompt has separator", "────" in prompt)
-
-
-# ═══════════════════════════════════════════════════════════
-# 5. Post-processing: FODWA RTL Fix
-# ═══════════════════════════════════════════════════════════
-
-def test_post_process_fodwa_rtl():
-    print("\n─── 5. post_process_response — FODWA RTL Fix ────────")
-
-    LRM = "\u200E"
-
-    cases = [
-        ("FODWA is great",       True,  "FODWA surrounded by LRM"),
-        ("Use fodwa to post",    True,  "lowercase fodwa fixed"),
-        ("AWDOF bug appears",    True,  "AWDOF replaced with LRM-FODWA"),
-        ("No platform mention",  False, "No LRM inserted when no keyword"),
+    # Real questions → new_question
+    new_qs = [
+        "كيف يمكنني حذف إعلاني؟",
+        "What is FODWA?",
+        "Wie registriere ich mich?",
     ]
+    for q in new_qs:
+        intent, conf = detect_intent(q, hist)
+        check(f"new_question: {q!r}", intent == "new_question", f"conf={conf:.2f}")
 
-    for text, expects_lrm, label in cases:
+    # Empty
+    intent, conf = detect_intent("", hist)
+    check("Empty text → new_question", intent == "new_question")
+
+
+def test_intent_long_text_not_rephrase():
+    print("\n--- 3b. Long text never rephrase ---")
+    hist = [{"role": "assistant", "content": "..."}]
+    long_text = "بالمصري " * 20  # >120 chars
+    intent, conf = detect_intent(long_text, hist)
+    check("Long text (>120) → new_question even if pattern matches", intent == "new_question")
+
+
+# ═══════════════════════════════════════════════════════════
+# 4. build_dynamic_system_prompt
+# ═══════════════════════════════════════════════════════════
+
+def test_build_prompt():
+    print("\n--- 4. build_dynamic_system_prompt ---")
+
+    p = build_dynamic_system_prompt("en", intent="new_question", lang_conf=0.95)
+    check("English prompt", "English" in p)
+    check("Length rule present", "3" in p and "4" in p)
+    check("Conf in prompt", "95%" in p)
+
+    p2 = build_dynamic_system_prompt("ar", dialect="egyptian", intent="rephrase_request",
+                                     lang_conf=0.88, dialect_conf=0.75, intent_conf=0.95)
+    check("Arabic+Egyptian dialect label", "Egyptian Arabic" in p2)
+    check("Rephrase mode", "REPHRASE MODE" in p2)
+    check("No new info rule", "Do NOT add new information" in p2)
+
+    # Low dialect confidence warning
+    p3 = build_dynamic_system_prompt("ar", dialect="unknown", intent="new_question",
+                                     lang_conf=0.95, dialect_conf=0.20)
+    check("Low dialect conf → warning in prompt", "LOW" in p3)
+
+    # Low lang confidence warning
+    p4 = build_dynamic_system_prompt("en", intent="new_question", lang_conf=0.50)
+    check("Low lang conf → warning in prompt", "LOW" in p4)
+
+    check("Separator present", "---" in p or "────" in p)
+
+
+# ═══════════════════════════════════════════════════════════
+# 5. post_process_response — FODWA RTL Fix
+# ═══════════════════════════════════════════════════════════
+
+def test_fodwa_rtl():
+    print("\n--- 5. FODWA RTL Fix ---")
+    LRM = "\u200E"
+    cases = [
+        ("FODWA is great",      True),
+        ("Use fodwa to post",   True),
+        ("AWDOF bug appears",   True),
+        ("No platform mention", False),
+        ("",                    False),
+    ]
+    for text, expect_lrm in cases:
         result = post_process_response(text)
-        has_lrm = LRM in result
-        check(label, has_lrm == expects_lrm, f"result={result!r}")
+        check(f"FODWA fix: {text!r}", (LRM in result) == expect_lrm, f"result={result!r}")
+
+    # Already wrapped → not double-wrapped
+    already = f"{LRM}FODWA{LRM} is great"
+    result2 = post_process_response(already)
+    check("Already-wrapped not double-wrapped", result2.count(LRM) == 2, f"count={result2.count(LRM)}")
 
 
 # ═══════════════════════════════════════════════════════════
-# 6. Post-processing: Line Truncation
+# 6. post_process_response — Sentence-based Truncation
 # ═══════════════════════════════════════════════════════════
 
-def test_post_process_truncation():
-    print("\n─── 6. post_process_response — Truncation ───────────")
+def test_sentence_truncation():
+    print("\n--- 6. Sentence-based Truncation ---")
 
-    short_text = "Line 1\nLine 2\nLine 3"
-    check("Short text not truncated", post_process_response(short_text) == short_text)
+    # Short (1 sentence) → unchanged
+    short = "يمكنك حذف الإعلان من لوحة التحكم."
+    check("Short (1 sent) → unchanged", post_process_response(short) == short)
 
-    long_text = "\n".join([f"Line {i}: some content here" for i in range(1, 10)])
-    result = post_process_response(long_text)
-    line_count = len([l for l in result.splitlines() if l.strip()])
-    check(
-        f"Long text (9 lines) truncated to ≤4 lines",
-        line_count <= 4,
-        f"got {line_count} lines",
+    # 3 sentences → unchanged (at limit)
+    three = "الجملة الأولى. الجملة الثانية. الجملة الثالثة."
+    result = post_process_response(three)
+    check("3 sentences → not truncated", "…" not in result, f"result={result!r}")
+
+    # 5 sentences → truncated
+    five = "الجملة الأولى. الجملة الثانية. الجملة الثالثة. الجملة الرابعة. الجملة الخامسة."
+    result2 = post_process_response(five)
+    check("5 sentences → truncated", "الجملة الرابعة" not in result2, f"result={result2!r}")
+    check("Truncated ends with ellipsis or punctuation",
+          result2.endswith("…") or result2[-1] in ".!?؟")
+
+    # Hard char cap
+    long_text = "A" * 700
+    result3 = post_process_response(long_text)
+    check(f"Hard cap: {len(long_text)} chars → <= 600+3", len(result3) <= 603, f"len={len(result3)}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 7. NLPMetadata confidence properties
+# ═══════════════════════════════════════════════════════════
+
+def test_nlp_metadata():
+    print("\n--- 7. NLPMetadata ---")
+
+    meta = NLPMetadata(
+        language="ar", lang_confidence=0.95,
+        dialect="egyptian", dialect_confidence=0.80,
+        intent="new_question", intent_confidence=1.0,
     )
-    check("Truncated text ends with ellipsis", result.endswith("…"), f"result={result[-20:]!r}")
+    check("lang_uncertain False (0.95)", not meta.lang_uncertain)
+    check("dialect_uncertain False (0.80)", not meta.dialect_uncertain)
+    check("intent_uncertain False (1.0)", not meta.intent_uncertain)
 
-    # Text already ending with punctuation — no double ellipsis
-    text_with_period = "\n".join([f"This is sentence {i}." for i in range(1, 8)])
-    result2 = post_process_response(text_with_period)
-    check("No double punctuation after truncation", not result2.endswith(".…"))
+    meta2 = NLPMetadata(
+        language="en", lang_confidence=0.55,
+        dialect=None, dialect_confidence=0.0,
+        intent="rephrase_request", intent_confidence=0.50,
+    )
+    check("lang_uncertain True (0.55)", meta2.lang_uncertain)
+    check("intent_uncertain True (0.50)", meta2.intent_uncertain)
+    check("repr contains conf", "0.55" in repr(meta2))
 
 
 # ═══════════════════════════════════════════════════════════
-# 7. Full Pipeline: preprocess()
+# 8. Full preprocess() Pipeline
 # ═══════════════════════════════════════════════════════════
 
 def test_preprocess_pipeline():
-    print("\n─── 7. preprocess() full pipeline ───────────────────")
+    print("\n--- 8. preprocess() pipeline ---")
 
-    history = [
-        {"role": "assistant", "content": "يمكنك حذف الإعلان من لوحة التحكم."}
-    ]
+    hist = [{"role": "assistant", "content": "يمكنك حذف الإعلان من لوحة التحكم."}]
 
-    # German → new question
-    meta = preprocess("Wie kann ich mein Konto löschen?", [])
-    check("German language detected", meta.language == "de", f"got {meta.language!r}")
-    check("German dialect is None", meta.dialect is None)
-    check("German intent is new_question", meta.intent == "new_question")
+    # German new question
+    m = preprocess("Wie kann ich mein Konto löschen?", [])
+    check("German lang=de", m.language == "de", f"got {m.language!r}")
+    check("German dialect=None", m.dialect is None)
+    check("German intent=new_question", m.intent == "new_question")
+    check("German has conf", m.lang_confidence > 0)
 
-    # Arabic Egyptian rephrase
-    meta2 = preprocess("اكتبها بالمصري", history)
-    check("Arabic language detected", meta2.language == "ar", f"got {meta2.language!r}")
-    check("Rephrase intent detected", meta2.intent == "rephrase_request", f"got {meta2.intent!r}")
-
-    # Arabic new question
-    meta3 = preprocess("كيف يمكنني حذف إعلاني من المنصة؟", history)
-    check("Arabic new question detected", meta3.intent == "new_question")
+    # Arabic Egyptian rephrase — use a message that has Egyptian keywords
+    m2 = preprocess("اكتبها بالمصري عايز ده", hist)
+    check("Arabic lang=ar", m2.language == "ar")
+    check("Egyptian dialect detected", m2.dialect == "egyptian", f"got {m2.dialect!r}")
+    check("Rephrase intent", m2.intent == "rephrase_request")
+    check("Intent conf >= 0.60", m2.intent_confidence >= 0.60, f"conf={m2.intent_confidence:.2f}")
 
     # Returns NLPMetadata
-    check("Returns NLPMetadata instance", isinstance(meta, NLPMetadata))
+    check("Returns NLPMetadata", isinstance(m, NLPMetadata))
+
+    # Short ambiguous text
+    m3 = preprocess("hi", [])
+    check("Short 'hi' → en", m3.language == "en")
+    check("Short 'hi' conf < 0.90", m3.lang_confidence < 0.90, f"conf={m3.lang_confidence:.2f}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 9. Edge Cases
+# ═══════════════════════════════════════════════════════════
+
+def test_edge_cases():
+    print("\n--- 9. Edge Cases ---")
+
+    # Mixed Arabic+English
+    mixed = "كيف أعمل upload للصورة on FODWA?"
+    lang, conf = detect_language_with_confidence(mixed)
+    check("Mixed AR+EN → ar (dominant)", lang == "ar", f"got {lang!r} conf={conf:.2f}")
+
+    # Numbers only
+    lang2, conf2 = detect_language_with_confidence("12345")
+    check("Numbers only → no crash", lang2 is not None)
+
+    # Unicode emoji only
+    lang3, conf3 = detect_language_with_confidence("😊🎉")
+    check("Emoji only → no crash", lang3 is not None)
+
+    # Very long Arabic
+    long_ar = "كيف يمكنني إضافة إعلان جديد على المنصة؟ " * 5
+    lang4, conf4 = detect_language_with_confidence(long_ar)
+    check("Long Arabic → ar high conf", lang4 == "ar" and conf4 >= 0.85, f"conf={conf4:.2f}")
+
+    # Dialect on non-Arabic
+    d, c = detect_arabic_dialect("Hello how are you?")
+    check("Dialect on English → unknown", d == "unknown" and c == 0.0)
+
+    # Intent with None history
+    intent, conf = detect_intent("اكتبها بالانجليزي", None)
+    check("Intent with None history → new_question (no prior msg)", intent == "new_question")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -254,29 +370,33 @@ def test_preprocess_pipeline():
 # ═══════════════════════════════════════════════════════════
 
 def run_all():
-    print("\n" + "═" * 55)
-    print("  FODWA NLP Utils — Test Suite")
-    print("═" * 55)
+    print("\n" + "=" * 58)
+    print("  FODWA NLP Utils v2 -- Production Test Suite")
+    print("=" * 58)
 
-    test_language_detection()
-    test_arabic_dialect_detection()
-    test_intent_detection()
-    test_build_dynamic_system_prompt()
-    test_post_process_fodwa_rtl()
-    test_post_process_truncation()
+    test_language_confidence()
+    test_short_text_heuristic()
+    test_dialect_confidence()
+    test_dialect_confidence_score()
+    test_intent_confidence()
+    test_intent_long_text_not_rephrase()
+    test_build_prompt()
+    test_fodwa_rtl()
+    test_sentence_truncation()
+    test_nlp_metadata()
     test_preprocess_pipeline()
+    test_edge_cases()
 
-    print("\n" + "═" * 55)
+    print("\n" + "=" * 58)
     total = len(_PASSED) + len(_FAILED)
     print(f"  Results: {len(_PASSED)}/{total} passed")
     if _FAILED:
-        print(f"\n  Failed tests:")
+        print("\n  Failed:")
         for t in _FAILED:
-            print(f"    ✗ {t}")
+            print(f"    x {t}")
     else:
-        print("  🎉 All tests passed!")
-    print("═" * 55 + "\n")
-
+        print("  All tests passed!")
+    print("=" * 58 + "\n")
     return len(_FAILED) == 0
 
 

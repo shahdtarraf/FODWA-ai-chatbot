@@ -1,17 +1,24 @@
 """
-NLP Utilities — Pre/Post-processing layer for FODWA Chatbot.
+NLP Utilities — Production-grade Pre/Post-processing for FODWA Chatbot.
 
-Responsibilities:
-  1. detect_language(text)          → ISO language code ('ar', 'en', 'de', ...)
-  2. detect_arabic_dialect(text)    → Dialect label ('egyptian', 'syrian', ...)
-  3. detect_intent(text, history)   → Intent label ('new_question', 'rephrase_request')
-  4. build_dynamic_system_prompt()  → Dynamic instructions appended to base SYSTEM_PROMPT
-  5. post_process_response(text)    → Fix FODWA RTL bug + truncate if needed
+v2 improvements over v1:
+  - detect_language_with_confidence() → (lang, confidence)
+    * Short text (<15 chars) uses heuristic only
+    * Low confidence flagged for GPT fallback
+  - detect_arabic_dialect() → (dialect, confidence)
+    * Expanded keyword coverage + weighted scoring
+    * Confidence = top_score / total_score
+  - detect_intent() → (intent, confidence)
+    * Distinguishes "translation request" vs "language mention"
+    * Context-aware: requires both pattern match AND prior history
+    * Confidence based on pattern strength
+  - post_process_response() — sentence-aware truncation (not line-based)
+  - NLPMetadata — now carries confidence scores for all three fields
+  - Structured logging: lang=ar(0.92) dialect=egyptian(0.81) intent=rephrase(0.95)
 
-Design rules:
-  - ZERO dependencies on chat_service, faiss_service, or openai_service.
-  - All functions are pure and stateless (except logging).
-  - Never raises — always returns a safe default.
+Design rules (unchanged):
+  - ZERO dependencies on chat_service / faiss_service / openai_service
+  - Never raises — always returns safe defaults
 """
 
 import re
@@ -19,240 +26,282 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # Constants
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
-# Left-to-Right Mark — forces "FODWA" to render correctly in RTL contexts
-_LRM = "\u200E"
+_LRM = "\u200E"          # Left-to-Right Mark
+_MAX_SENTENCES = 3       # max sentences in truncated response
+_MAX_CHARS = 600         # hard character cap (safety net)
 
-# Maximum lines allowed in a response before hard truncation
-_MAX_LINES = 4
+# Confidence thresholds
+_LANG_CONFIDENCE_MIN = 0.70    # below → treat as uncertain
+_DIALECT_CONFIDENCE_MIN = 0.40
+_INTENT_CONFIDENCE_MIN = 0.60
 
-# Maximum characters as a secondary safety net
-_MAX_CHARS = 600
+# Short text threshold — below this, langdetect is unreliable
+_SHORT_TEXT_CHARS = 15
 
 
-# ─────────────────────────────────────────────────────────────
-# 1. Language Detection
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 1. Language Detection  (with confidence)
+# ──────────────────────────────────────────────
 
-def detect_language(text: str) -> str:
+def _arabic_ratio(text: str) -> float:
+    """Fraction of Arabic Unicode characters in text."""
+    if not text:
+        return 0.0
+    ar = sum(1 for c in text if "\u0600" <= c <= "\u06FF")
+    return ar / len(text)
+
+
+def _latin_ratio(text: str) -> float:
+    """Fraction of Latin characters in text."""
+    if not text:
+        return 0.0
+    lat = sum(1 for c in text if "A" <= c.upper() <= "Z")
+    return lat / len(text)
+
+
+def detect_language_with_confidence(text: str) -> tuple[str, float]:
     """
-    Detect the language of the input text.
+    Detect language and return (lang_code, confidence 0-1).
 
-    Returns:
-        ISO 639-1 language code string, e.g. 'ar', 'en', 'de', 'fr', 'tr'.
-        Falls back to 'en' on any error.
+    Strategy:
+      1. Empty → ('en', 1.0)
+      2. Arabic ratio > 0.30 → ('ar', ratio clamped to 1.0)  [fast heuristic]
+      3. Short text (<15 chars):
+           - Latin ratio > 0.5 → ('en', 0.65)  [heuristic]
+           - else → ('en', 0.5)
+      4. langdetect.detect_langs() for full confidence
+      5. Fallback → ('en', 0.5)
     """
-    if not text or not text.strip():
-        return "en"
+    stripped = (text or "").strip()
+    if not stripped:
+        return "en", 1.0
 
-    # Fast Arabic check via Unicode range (avoids langdetect overhead for common case)
-    arabic_chars = sum(1 for c in text if "\u0600" <= c <= "\u06FF")
-    if arabic_chars / max(len(text.strip()), 1) > 0.3:
-        logger.debug(f"[NLP] Language detected via Unicode heuristic: ar")
-        return "ar"
+    ar_ratio = _arabic_ratio(stripped)
+    if ar_ratio > 0.30:
+        conf = min(ar_ratio * 1.2, 1.0)
+        logger.debug(f"[NLP] lang=ar via heuristic (conf={conf:.2f})")
+        return "ar", round(conf, 2)
+
+    if len(stripped) < _SHORT_TEXT_CHARS:
+        if _latin_ratio(stripped) > 0.5:
+            return "en", 0.65
+        return "en", 0.50
 
     try:
-        from langdetect import detect, LangDetectException
-        lang = detect(text)
-        logger.debug(f"[NLP] Language detected via langdetect: {lang}")
-        return lang
-    except Exception as e:
-        logger.warning(f"[NLP] langdetect failed: {e} — falling back to 'en'")
-        return "en"
+        from langdetect import detect_langs
+        results = detect_langs(stripped)
+        if results:
+            top = results[0]
+            logger.debug(f"[NLP] langdetect → {top.lang}({top.prob:.2f})")
+            return top.lang, round(top.prob, 2)
+    except Exception as exc:
+        logger.warning(f"[NLP] langdetect failed: {exc}")
+
+    return "en", 0.50
 
 
-# ─────────────────────────────────────────────────────────────
-# 2. Arabic Dialect Detection
-# ─────────────────────────────────────────────────────────────
+def detect_language(text: str) -> str:
+    """Backwards-compatible wrapper — returns lang code only."""
+    lang, _ = detect_language_with_confidence(text)
+    return lang
 
-# Rule-based keyword map. Order matters: more specific dialects first.
-_DIALECT_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("egyptian",   ["ازيك", "ازيكم", "عامل ايه", "عامله ايه", "ايه ده", "ده", "دي",
-                    "ايه", "مش عارف", "مش عارفة", "بقى", "بقا", "اللي", "كده",
-                    "عايز", "عايزة", "فين", "امتى", "ليه", "هو ايه"]),
 
-    ("syrian",     ["شو", "هلق", "كيفك", "شلونك", "منيح", "هيك", "عنجد", "ما في",
-                    "في شي", "ليش", "هون", "هناك", "شو بدك", "شو بدي"]),
+# ──────────────────────────────────────────────
+# 2. Arabic Dialect Detection  (with confidence)
+# ──────────────────────────────────────────────
 
-    ("iraqi",      ["شگول", "شلونك", "شنو", "هواية", "گاعد", "چي", "بعد شوية",
-                    "أكو", "ماكو", "شبيك", "يمه", "أبه", "گلتلك"]),
-
-    ("gulf",       ["وش", "ليش", "ايش", "كيف حالك", "إيش", "زين", "وايد",
-                    "شلون", "حيل", "عيل", "يبه", "يمه", "ما ادري", "ترى"]),
-
-    ("moroccan",   ["واش", "كيداير", "كيف داير", "بزاف", "ماشي", "دابا", "هاد",
-                    "بغيت", "مزيان", "لا باس"]),
-
-    ("tunisian",   ["شنية", "برشة", "ياسر", "فما", "نحب", "نعرف", "كيفاش",
-                    "شنو", "علاش"]),
-
-    ("algerian",   ["واش راك", "راك", "نتا", "نتي", "كيراك", "رانا", "هكذا",
-                    "دروك", "تاع"]),
-
-    ("libyan",     ["شحالك", "شحالكم", "كيفاش", "أشحال", "شكون"]),
-
-    ("sudanese",   ["زين", "كيفك", "ما علينا", "يا زول", "زول", "ما قادر"]),
-
-    ("yemeni",     ["كيف حالك", "ايش", "وش", "شو", "ما اعرف", "اليوم"]),
-
-    ("jordanian",  ["شو بدك", "والله", "هلأ", "هلق", "بدي", "شو صار",
-                    "يعني إيش"]),
-
-    ("levantine",  ["كيفك", "شو", "هلأ", "عم", "رح", "بدي", "ما بدي"]),
-
-    ("msa",        ["هل يمكنني", "أود أن", "أرجو", "يرجى", "من فضلك"]),
+# Each entry: (dialect, [(keyword, weight), ...])
+# Weight 2 = strong marker, 1 = common word
+_DIALECT_KEYWORDS: list[tuple[str, list[tuple[str, int]]]] = [
+    ("egyptian", [
+        ("ايه ده", 2), ("عامل ايه", 2), ("ازيك", 2), ("امتى", 2),
+        ("عايز", 2), ("عايزة", 2), ("مش عارف", 2), ("بقى", 2),
+        ("كده", 2), ("فين", 1), ("ليه", 1), ("ده", 1), ("دي", 1),
+        ("ايه", 1), ("بقا", 1), ("اللي", 1), ("هو ايه", 2),
+        ("مش عارفة", 2), ("ازيكم", 2), ("عامله ايه", 2),
+    ]),
+    ("syrian", [
+        ("شو", 2), ("هلق", 2), ("عنجد", 2), ("منيح", 2), ("هيك", 2),
+        ("ما في", 2), ("في شي", 2), ("ليش", 2), ("هون", 2),
+        ("شو بدك", 2), ("شو بدي", 2), ("شلونك", 1), ("كيفك", 1),
+        ("هناك", 1), ("شو صار", 2), ("رح", 1),
+    ]),
+    ("iraqi", [
+        ("شگول", 2), ("شنو", 2), ("هواية", 2), ("گاعد", 2), ("چي", 2),
+        ("أكو", 2), ("ماكو", 2), ("شبيك", 2), ("يمه", 2), ("أبه", 2),
+        ("گلتلك", 2), ("شلونك", 1), ("بعد شوية", 2),
+    ]),
+    ("gulf", [
+        ("وش", 2), ("ايش", 2), ("إيش", 2), ("وايد", 2), ("زين", 2),
+        ("شلون", 2), ("حيل", 2), ("عيل", 2), ("يبه", 2), ("ما ادري", 2),
+        ("ترى", 2), ("يمه", 1), ("ليش", 1), ("كيف حالك", 1),
+        ("إن شاء الله", 1), ("والله", 1), ("ما قلت", 2),
+    ]),
+    ("moroccan", [
+        ("واش", 2), ("كيداير", 2), ("كيف داير", 2), ("بزاف", 2),
+        ("ماشي", 2), ("دابا", 2), ("هاد", 2), ("بغيت", 2),
+        ("مزيان", 2), ("لا باس", 2), ("فين غادي", 2), ("شنو", 1),
+    ]),
+    ("tunisian", [
+        ("شنية", 2), ("برشة", 2), ("ياسر", 2), ("فما", 2), ("نحب", 2),
+        ("نعرف", 2), ("كيفاش", 2), ("علاش", 2), ("شنو", 1),
+        ("باهي", 2), ("نحبش", 2),
+    ]),
+    ("algerian", [
+        ("واش راك", 2), ("راك", 2), ("نتا", 2), ("نتي", 2),
+        ("كيراك", 2), ("رانا", 2), ("دروك", 2), ("تاع", 2),
+        ("بلاك", 2), ("يصح", 2),
+    ]),
+    ("libyan", [
+        ("شحالك", 2), ("شحالكم", 2), ("أشحال", 2), ("شكون", 2),
+        ("كيفاش", 1), ("بهي", 2), ("مرحبا", 1),
+    ]),
+    ("sudanese", [
+        ("يا زول", 2), ("زول", 2), ("ما علينا", 2), ("ما قادر", 2),
+        ("زين", 1), ("كيفك", 1), ("طيب", 1),
+    ]),
+    ("yemeni", [
+        ("شو", 1), ("ايش", 1), ("وش", 1), ("ما اعرف", 1),
+        ("هيه", 2), ("تعال", 1), ("عشان", 1),
+    ]),
+    ("jordanian", [
+        ("هلأ", 2), ("يعني إيش", 2), ("شو صار", 2), ("والله", 1),
+        ("شو بدك", 1), ("بدي", 1), ("هيك", 1),
+    ]),
+    ("levantine", [
+        ("عم", 2), ("رح", 2), ("ما بدي", 2), ("بدي", 1),
+        ("هلأ", 1), ("شو", 1), ("كيفك", 1),
+    ]),
+    ("msa", [
+        ("هل يمكنني", 2), ("أود أن", 2), ("أرجو", 2), ("يرجى", 2),
+        ("من فضلك", 1), ("تفضل", 1), ("يمكن", 1),
+    ]),
 ]
 
 
-def detect_arabic_dialect(text: str) -> str:
+def detect_arabic_dialect(text: str) -> tuple[str, float]:
     """
-    Detect the Arabic dialect using rule-based keyword heuristics.
-
-    Args:
-        text: Arabic input text.
+    Detect Arabic dialect.
 
     Returns:
-        Dialect label string. Possible values:
-        'egyptian', 'syrian', 'iraqi', 'gulf', 'moroccan', 'tunisian',
-        'algerian', 'libyan', 'sudanese', 'yemeni', 'jordanian', 'levantine',
-        'msa', 'unknown'.
+        (dialect_label, confidence) where confidence in [0, 1].
+        dialect_label one of: egyptian, syrian, iraqi, gulf, moroccan,
+        tunisian, algerian, libyan, sudanese, yemeni, jordanian,
+        levantine, msa, unknown.
     """
     if not text or not text.strip():
-        return "unknown"
+        return "unknown", 0.0
 
-    text_lower = text.lower().strip()
+    t = text.lower().strip()
     scores: dict[str, int] = {}
+    total_weight = 0
 
-    for dialect, keywords in _DIALECT_KEYWORDS:
-        count = sum(1 for kw in keywords if kw in text_lower)
-        if count > 0:
-            scores[dialect] = count
+    for dialect, kw_list in _DIALECT_KEYWORDS:
+        score = sum(w for kw, w in kw_list if kw in t)
+        if score > 0:
+            scores[dialect] = score
+            total_weight += score
 
     if not scores:
-        logger.debug("[NLP] Arabic dialect: unknown (no keywords matched)")
-        return "unknown"
+        logger.debug("[NLP] dialect=unknown (no keywords matched)")
+        return "unknown", 0.0
 
     best = max(scores, key=lambda d: scores[d])
-    logger.debug(f"[NLP] Arabic dialect detected: {best} (score={scores[best]})")
-    return best
+    confidence = round(scores[best] / max(total_weight, 1), 2)
+    logger.debug(f"[NLP] dialect={best}({confidence:.2f}) scores={scores}")
+    return best, confidence
 
 
-# ─────────────────────────────────────────────────────────────
-# 3. Intent Detection
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 3. Intent Detection  (with confidence)
+# ──────────────────────────────────────────────
 
-# Patterns that indicate the user wants to rephrase/translate the PREVIOUS answer.
-# Grouped into clear intent categories.
-_REPHRASE_PATTERNS: list[re.Pattern] = [
-    # ── Language switch requests ────────────────────────────
-    re.compile(r"\b(in\s+english|translate\s+(to|into)\s+english)\b", re.IGNORECASE),
-    re.compile(r"\b(auf\s+deutsch|translate\s+(to|into)\s+german)\b", re.IGNORECASE),
-    re.compile(r"\b(en\s+français|translate\s+(to|into)\s+french)\b", re.IGNORECASE),
-    re.compile(r"\b(translate|ترجم|ترجمة|ترجملي|حولها)\b", re.IGNORECASE),
-    re.compile(r"(اكتب(ها|ه|لي)?\s*(بالانجليزي|بالعربي|بالألماني|بالفرنسي|بالتركي))", re.IGNORECASE),
-    re.compile(r"(قلها|قوله|قولها)\s*(بالانجليزي|بالعربي|بالألماني|بالفرنسي)", re.IGNORECASE),
-    re.compile(r"(بالإنجليزي|بالانجليزي|بالإنكليزي|باللغة الإنجليزية)", re.IGNORECASE),
-    re.compile(r"(بالعربي|باللغة العربية|بالعربية)", re.IGNORECASE),
-    re.compile(r"(بالألماني|باللغة الألمانية|بالالماني)", re.IGNORECASE),
-    re.compile(r"(بالفرنسي|باللغة الفرنسية)", re.IGNORECASE),
-    re.compile(r"(بالتركي|باللغة التركية)", re.IGNORECASE),
-
-    # ── Dialect switch requests ──────────────────────────────
-    re.compile(r"(حولها|حوله|اكتبها|قولها|قله)\s*(بالمصري|بالسوري|بالعراقي|بالخليجي|بالمغربي|بالتونسي|بالجزائري|بالليبي|بالأردني|بالشامي|بالفصحى|بالعامية)", re.IGNORECASE),
-    re.compile(r"(بالمصري|بالمصرية|باللهجة المصرية)", re.IGNORECASE),
-    re.compile(r"(بالسوري|باللهجة السورية|بالشامي)", re.IGNORECASE),
-    re.compile(r"(بالعراقي|باللهجة العراقية)", re.IGNORECASE),
-    re.compile(r"(بالخليجي|باللهجة الخليجية|بالسعودي|بالإماراتي|بالكويتي)", re.IGNORECASE),
-    re.compile(r"(بالمغربي|باللهجة المغربية|بالدارجة)", re.IGNORECASE),
-    re.compile(r"(بالأردني|باللهجة الأردنية)", re.IGNORECASE),
-    re.compile(r"(بالفصحى|بالعربية الفصحى|بالمعياري)", re.IGNORECASE),
-    re.compile(r"(بالعامية)", re.IGNORECASE),
-
-    # ── Rephrase without translation ────────────────────────
-    re.compile(r"(أعد(ها|ه)?\s*(بكلمات|بأسلوب|بطريقة)\s*أبسط)", re.IGNORECASE),
-    re.compile(r"(اشرح(ها|ه)?\s*(بطريقة|بأسلوب)\s*أبسط)", re.IGNORECASE),
-    re.compile(r"(بشكل\s*أبسط|بكلمات\s*أبسط|بطريقة\s*أسهل)", re.IGNORECASE),
-    re.compile(r"(simplify|rephrase|rewrite|say\s+it\s+(again|differently))", re.IGNORECASE),
+# (pattern, weight) — higher weight = stronger rephrase signal
+_REPHRASE_PATTERNS: list[tuple[re.Pattern, float]] = [
+    # Strong: explicit translate/rephrase verb + target
+    (re.compile(r"(اكتب(ها|ه|لي)?\s*(بالانجليزي|بالعربي|بالألماني|بالفرنسي|بالتركي))", re.I), 1.0),
+    (re.compile(r"(حولها|حوله|اكتبها|قولها|قله)\s*(بالمصري|بالسوري|بالعراقي|بالخليجي|بالمغربي|بالتونسي|بالجزائري|بالليبي|بالأردني|بالشامي|بالفصحى|بالعامية)", re.I), 1.0),
+    (re.compile(r"(حولها|حوله|اكتبها)\s*ل(لمصري|لسوري|لعراقي|لخليجي|لمغربي|لتونسي|لجزائري|لليبي|لأردني|لشامي|للفصحى|للعامية)", re.I), 1.0),
+    (re.compile(r"(translate\s+(to|into)\s+\w+|ترجملي|ترجم\s+ل)", re.I), 1.0),
+    (re.compile(r"(قلها|قوله|قولها)\s*(بالانجليزي|بالعربي|بالألماني|بالفرنسي)", re.I), 1.0),
+    (re.compile(r"\b(auf\s+deutsch|en\s+français|in\s+english)\b", re.I), 0.9),
+    # Medium: just the language/dialect name (can be ambiguous)
+    (re.compile(r"^(بالإنجليزي|بالانجليزي|بالإنكليزي)$", re.I), 0.9),
+    (re.compile(r"^(بالعربي|بالعربية)$", re.I), 0.85),
+    (re.compile(r"^(بالألماني|بالفرنسي|بالتركي)$", re.I), 0.85),
+    (re.compile(r"^(بالمصري|بالسوري|بالعراقي|بالخليجي|بالمغربي)$", re.I), 0.85),
+    (re.compile(r"^(بالفصحى|بالعامية|بالشامي|بالأردني)$", re.I), 0.85),
+    # Medium: rephrase without translation
+    (re.compile(r"(أعد(ها|ه)?\s*(بكلمات|بأسلوب|بطريقة)\s*أبسط)", re.I), 0.9),
+    (re.compile(r"(بشكل\s*أبسط|بكلمات\s*أبسط|بطريقة\s*أسهل)", re.I), 0.85),
+    (re.compile(r"\b(simplify|rephrase|rewrite|say\s+it\s+(again|differently))\b", re.I), 0.9),
+    # Weaker: bare language mention inside a longer sentence
+    (re.compile(r"(بالإنجليزي|بالانجليزي|بالعربي|بالألماني|بالفرنسي|بالتركي)", re.I), 0.65),
+    (re.compile(r"(بالمصري|بالمصرية|بالسوري|بالعراقي|بالخليجي|بالمغربي)", re.I), 0.65),
+    (re.compile(r"(بالفصحى|بالعربية الفصحى|بالعامية)", re.I), 0.65),
+    (re.compile(r"\b(translate|ترجم|ترجمة)\b", re.I), 0.70),
 ]
 
 
-def detect_intent(text: str, history: list[dict] | None = None) -> str:
+def detect_intent(text: str, history: list[dict] | None = None) -> tuple[str, float]:
     """
-    Detect user intent from the message text and conversation history.
+    Detect intent and return (intent_label, confidence).
 
-    Logic:
-      - If the message matches any rephrase/translation pattern AND
-        there is at least one previous assistant message → 'rephrase_request'
-      - Otherwise → 'new_question'
-
-    Args:
-        text:    The user's current message.
-        history: Conversation history list (role/content dicts).
-
-    Returns:
-        'rephrase_request' | 'new_question'
+    Rules:
+      - rephrase_request only if: pattern matches + prior assistant msg exists
+        + message is short (<= 120 chars)
+      - new_question otherwise
     """
     if not text or not text.strip():
-        return "new_question"
+        return "new_question", 1.0
 
-    text_stripped = text.strip()
+    stripped = text.strip()
 
-    # Only consider rephrase if the message is short (not a new detailed question)
-    # and there's previous history to rephrase
-    has_prior_assistant = any(
-        m.get("role") == "assistant" for m in (history or [])
-    )
+    has_prior = any(m.get("role") == "assistant" for m in (history or []))
 
-    if has_prior_assistant and len(text_stripped) < 120:
-        for pattern in _REPHRASE_PATTERNS:
-            if pattern.search(text_stripped):
-                logger.debug(f"[NLP] Intent detected: rephrase_request (pattern={pattern.pattern[:40]})")
-                return "rephrase_request"
+    if has_prior and len(stripped) <= 120:
+        best_conf = 0.0
+        for pattern, weight in _REPHRASE_PATTERNS:
+            if pattern.search(stripped):
+                if weight > best_conf:
+                    best_conf = weight
+        if best_conf >= _INTENT_CONFIDENCE_MIN:
+            logger.debug(f"[NLP] intent=rephrase_request({best_conf:.2f})")
+            return "rephrase_request", round(best_conf, 2)
 
-    logger.debug("[NLP] Intent detected: new_question")
-    return "new_question"
+    return "new_question", 1.0
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # 4. Dynamic System Prompt Builder
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 _DIALECT_LABELS: dict[str, str] = {
-    "egyptian":   "Egyptian Arabic (عامية مصرية)",
-    "syrian":     "Syrian Arabic (لهجة سورية شامية)",
-    "iraqi":      "Iraqi Arabic (لهجة عراقية)",
-    "gulf":       "Gulf Arabic (لهجة خليجية)",
-    "moroccan":   "Moroccan Darija (الدارجة المغربية)",
-    "tunisian":   "Tunisian Arabic (اللهجة التونسية)",
-    "algerian":   "Algerian Arabic (اللهجة الجزائرية)",
-    "libyan":     "Libyan Arabic (اللهجة الليبية)",
-    "sudanese":   "Sudanese Arabic (اللهجة السودانية)",
-    "yemeni":     "Yemeni Arabic (اللهجة اليمنية)",
-    "jordanian":  "Jordanian Arabic (اللهجة الأردنية)",
-    "levantine":  "Levantine Arabic (اللهجة الشامية)",
-    "msa":        "Modern Standard Arabic (العربية الفصحى)",
-    "unknown":    "Arabic (detect dialect from context)",
+    "egyptian":  "Egyptian Arabic (عامية مصرية)",
+    "syrian":    "Syrian Arabic (لهجة سورية شامية)",
+    "iraqi":     "Iraqi Arabic (لهجة عراقية)",
+    "gulf":      "Gulf Arabic (لهجة خليجية)",
+    "moroccan":  "Moroccan Darija (الدارجة المغربية)",
+    "tunisian":  "Tunisian Arabic (اللهجة التونسية)",
+    "algerian":  "Algerian Arabic (اللهجة الجزائرية)",
+    "libyan":    "Libyan Arabic (اللهجة الليبية)",
+    "sudanese":  "Sudanese Arabic (اللهجة السودانية)",
+    "yemeni":    "Yemeni Arabic (اللهجة اليمنية)",
+    "jordanian": "Jordanian Arabic (اللهجة الأردنية)",
+    "levantine": "Levantine Arabic (اللهجة الشامية)",
+    "msa":       "Modern Standard Arabic (العربية الفصحى)",
+    "unknown":   "Arabic (detect dialect from context)",
 }
 
 _LANG_LABELS: dict[str, str] = {
-    "ar": "Arabic",
-    "en": "English",
-    "de": "German",
-    "fr": "French",
-    "tr": "Turkish",
-    "es": "Spanish",
-    "it": "Italian",
-    "nl": "Dutch",
-    "pl": "Polish",
-    "ru": "Russian",
-    "zh": "Chinese",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "fa": "Persian",
-    "ur": "Urdu",
+    "ar": "Arabic", "en": "English", "de": "German", "fr": "French",
+    "tr": "Turkish", "es": "Spanish", "it": "Italian", "nl": "Dutch",
+    "pl": "Polish", "ru": "Russian", "zh": "Chinese", "ja": "Japanese",
+    "ko": "Korean", "fa": "Persian", "ur": "Urdu",
 }
 
 
@@ -260,173 +309,201 @@ def build_dynamic_system_prompt(
     lang: str,
     dialect: str | None = None,
     intent: str = "new_question",
+    lang_conf: float = 1.0,
+    dialect_conf: float = 1.0,
+    intent_conf: float = 1.0,
     rephrase_target: str | None = None,
 ) -> str:
     """
-    Build the dynamic instruction block to be appended to the base SYSTEM_PROMPT.
+    Build the dynamic instruction block to append to BASE_SYSTEM_PROMPT.
 
-    This does NOT replace the base prompt — it extends it with
-    request-specific instructions so the base rules are always preserved.
-
-    Args:
-        lang:            Detected language code (e.g. 'ar', 'en', 'de').
-        dialect:         Detected Arabic dialect (only used if lang == 'ar').
-        intent:          'new_question' or 'rephrase_request'.
-        rephrase_target: Optional explicit target language/dialect if user specified.
-
-    Returns:
-        Dynamic instruction string to append to the base SYSTEM_PROMPT.
+    Low-confidence signals are communicated to GPT so it can compensate.
     """
     lang_label = _LANG_LABELS.get(lang, lang.upper())
-    instructions: list[str] = []
+    lines: list[str] = [
+        "────────────────────────",
+        "DYNAMIC REQUEST INSTRUCTIONS (THIS REQUEST ONLY)",
+        "────────────────────────",
+    ]
 
-    instructions.append("────────────────────────")
-    instructions.append("DYNAMIC REQUEST INSTRUCTIONS (THIS REQUEST ONLY)")
-    instructions.append("────────────────────────")
-
-    # ── Language instruction ──
+    # ── Language ──
     if lang == "ar":
-        dialect_label = _DIALECT_LABELS.get(dialect or "unknown", "Arabic")
-        instructions.append(f"✅ Detected language: Arabic — Dialect: {dialect_label}")
-        instructions.append(f"👉 You MUST respond in: {dialect_label}")
-        instructions.append("   Use natural spoken vocabulary of this dialect. Do NOT switch to MSA or another dialect.")
+        dlabel = _DIALECT_LABELS.get(dialect or "unknown", "Arabic")
+        lines.append(f"✅ Detected: Arabic — Dialect: {dlabel} (conf={lang_conf:.0%}/{dialect_conf:.0%})")
+        if dialect_conf < _DIALECT_CONFIDENCE_MIN:
+            lines.append("⚠️  Dialect confidence LOW — infer from message vocabulary.")
+        lines.append(f"👉 Respond in: {dlabel}")
+        lines.append("   Natural spoken vocab only. Do NOT switch to MSA or another dialect.")
     else:
-        instructions.append(f"✅ Detected language: {lang_label}")
-        instructions.append(f"👉 You MUST respond entirely in: {lang_label}")
+        lines.append(f"✅ Detected: {lang_label} (conf={lang_conf:.0%})")
+        if lang_conf < _LANG_CONFIDENCE_MIN:
+            lines.append("⚠️  Language confidence LOW — infer from message vocabulary.")
+        lines.append(f"👉 Respond entirely in: {lang_label}")
 
-    # ── Intent instruction ──
+    # ── Intent ──
     if intent == "rephrase_request":
         target = rephrase_target or (
             _DIALECT_LABELS.get(dialect or "unknown") if lang == "ar" else lang_label
         )
-        instructions.append("")
-        instructions.append("🔄 REPHRASE MODE — CRITICAL:")
-        instructions.append(f"   Rewrite the PREVIOUS assistant answer in: {target}")
-        instructions.append("   ⛔ Do NOT add any new information.")
-        instructions.append("   ⛔ Do NOT search for new content.")
-        instructions.append("   ⛔ Do NOT explain or comment on the rephrasing.")
-        instructions.append("   ✅ Output ONLY the rephrased version of the previous answer.")
+        lines += [
+            "", "🔄 REPHRASE MODE — CRITICAL:",
+            f"   Rewrite the PREVIOUS assistant answer in: {target}",
+            "   ⛔ Do NOT add new information.",
+            "   ⛔ Do NOT search for new content.",
+            "   ✅ Output ONLY the rephrased version.",
+        ]
     else:
-        instructions.append("")
-        instructions.append("🔍 NEW QUESTION MODE:")
-        instructions.append("   Answer based on the provided context only.")
-        instructions.append("   If the context does not contain the answer, say so briefly.")
+        lines += [
+            "", "🔍 NEW QUESTION MODE:",
+            "   Answer based on provided context only.",
+            "   If context lacks the answer, say so briefly.",
+        ]
 
-    # ── Length constraint (always applied) ──
-    instructions.append("")
-    instructions.append("📏 RESPONSE LENGTH — STRICT RULE:")
-    instructions.append("   ⛔ Maximum 3 to 4 lines ONLY.")
-    instructions.append("   ⛔ No essays, no bullet lists with 5+ items, no long explanations.")
-    instructions.append("   ✅ Be direct. Be concise. Answer the question only.")
-    instructions.append("   ✅ If you need a list, maximum 3 items.")
-    instructions.append("────────────────────────")
+    # ── Length (always) ──
+    lines += [
+        "", "📏 RESPONSE LENGTH — STRICT:",
+        "   ⛔ Max 3–4 lines. No long explanations.",
+        "   ✅ Direct. Concise. Answer only.",
+        "   ✅ Lists: max 3 items.",
+        "────────────────────────",
+    ]
+    return "\n".join(lines)
 
-    return "\n".join(instructions)
 
+# ──────────────────────────────────────────────
+# 5. Post-processing  (sentence-aware truncation)
+# ──────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# 5. Post-processing
-# ─────────────────────────────────────────────────────────────
-
-# Matches "FODWA" in any casing, possibly already wrapped in LRM markers
 _FODWA_PATTERN = re.compile(
     r"(?<!\u200E)\b(FODWA|Fodwa|fodwa|AWDOF|awdof)\b(?!\u200E)",
     re.IGNORECASE,
 )
 
+# Sentence boundary: ends with . ! ? … ؟ ؛ ، followed by space/newline/end
+_SENT_END = re.compile(r"[.!?…؟؛،]\s*")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences, preserving delimiters."""
+    parts = _SENT_END.split(text)
+    delims = _SENT_END.findall(text)
+    sentences = []
+    for i, part in enumerate(parts):
+        part = part.strip()
+        if part:
+            delim = delims[i].strip() if i < len(delims) else ""
+            sentences.append(part + (delim if delim else ""))
+    return [s for s in sentences if s.strip()]
+
 
 def post_process_response(text: str) -> str:
     """
-    Apply post-processing to LLM output before returning to the user.
-
-    Operations (in order):
-      1. Fix FODWA RTL rendering bug by wrapping with LRM markers.
-      2. Hard-truncate response if it exceeds allowed line/char limits.
-
-    Args:
-        text: Raw LLM response string.
-
-    Returns:
-        Cleaned, safe-to-display response string.
+    Post-process LLM output:
+      1. Fix FODWA RTL bug (LRM markers).
+      2. Sentence-aware truncation to _MAX_SENTENCES.
+      3. Hard character cap as safety net.
     """
     if not text:
         return text
 
-    # ── Step 1: Fix FODWA RTL bug ──────────────────────────
-    # Replace any variant (FODWA / Fodwa / AWDOF) with LRM-wrapped canonical form
+    # Step 1: FODWA RTL fix
     fixed = _FODWA_PATTERN.sub(f"{_LRM}FODWA{_LRM}", text)
-
     if fixed != text:
         logger.debug("[NLP] post_process: FODWA RTL fix applied")
 
-    # ── Step 2: Hard truncation (safety net) ────────────────
-    lines = fixed.splitlines()
-
-    # Filter empty-only trailing lines
-    while lines and not lines[-1].strip():
-        lines.pop()
-
-    if len(lines) > _MAX_LINES:
+    # Step 2: Sentence-based truncation
+    sentences = _split_sentences(fixed)
+    if len(sentences) > _MAX_SENTENCES:
         logger.warning(
-            f"[NLP] post_process: Response exceeded {_MAX_LINES} lines "
-            f"({len(lines)} lines). Truncating."
+            f"[NLP] post_process: {len(sentences)} sentences → truncating to {_MAX_SENTENCES}"
         )
-        truncated = "\n".join(lines[:_MAX_LINES])
-        # Append ellipsis only if the cut line wasn't already ending with punctuation
-        last_char = truncated.rstrip()[-1] if truncated.rstrip() else ""
-        if last_char not in (".", "!", "?", "…", "،", "؟", "؛"):
-            truncated += "…"
-        fixed = truncated
+        kept = sentences[:_MAX_SENTENCES]
+        fixed = " ".join(kept)
+        last = fixed.rstrip()[-1] if fixed.rstrip() else ""
+        if last not in (".", "!", "?", "…", "،", "؟", "؛"):
+            fixed = fixed.rstrip() + "…"
 
-    # Secondary character limit check
+    # Step 3: Hard char cap
     if len(fixed) > _MAX_CHARS:
-        logger.warning(
-            f"[NLP] post_process: Response exceeded {_MAX_CHARS} chars. Truncating."
-        )
+        logger.warning(f"[NLP] post_process: {len(fixed)} chars → hard cap {_MAX_CHARS}")
         fixed = fixed[:_MAX_CHARS].rstrip() + "…"
 
     return fixed
 
 
-# ─────────────────────────────────────────────────────────────
-# 6. Convenience: Full Pre-processing Pipeline
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 6. NLPMetadata + preprocess() pipeline
+# ──────────────────────────────────────────────
 
 class NLPMetadata:
-    """Structured result from the NLP pre-processing pipeline."""
+    """Structured result from the NLP pre-processing pipeline (v2)."""
 
-    __slots__ = ("language", "dialect", "intent")
+    __slots__ = (
+        "language", "lang_confidence",
+        "dialect", "dialect_confidence",
+        "intent", "intent_confidence",
+    )
 
-    def __init__(self, language: str, dialect: str | None, intent: str):
+    def __init__(
+        self,
+        language: str, lang_confidence: float,
+        dialect: str | None, dialect_confidence: float,
+        intent: str, intent_confidence: float,
+    ):
         self.language = language
+        self.lang_confidence = lang_confidence
         self.dialect = dialect
+        self.dialect_confidence = dialect_confidence
         self.intent = intent
+        self.intent_confidence = intent_confidence
+
+    @property
+    def lang_uncertain(self) -> bool:
+        return self.lang_confidence < _LANG_CONFIDENCE_MIN
+
+    @property
+    def dialect_uncertain(self) -> bool:
+        return self.dialect_confidence < _DIALECT_CONFIDENCE_MIN
+
+    @property
+    def intent_uncertain(self) -> bool:
+        return self.intent_confidence < _INTENT_CONFIDENCE_MIN
 
     def __repr__(self) -> str:
         return (
-            f"NLPMetadata(language={self.language!r}, "
-            f"dialect={self.dialect!r}, intent={self.intent!r})"
+            f"NLPMetadata("
+            f"lang={self.language!r}({self.lang_confidence:.2f}), "
+            f"dialect={self.dialect!r}({self.dialect_confidence:.2f}), "
+            f"intent={self.intent!r}({self.intent_confidence:.2f}))"
         )
 
 
 def preprocess(text: str, history: list[dict] | None = None) -> NLPMetadata:
     """
-    Run the full NLP pre-processing pipeline on a user message.
+    Run the full NLP pre-processing pipeline.
 
-    Args:
-        text:    User's raw message.
-        history: Current conversation history list.
-
-    Returns:
-        NLPMetadata with language, dialect, and intent.
+    Returns NLPMetadata with language, dialect, intent + confidence scores.
+    Structured log format: lang=ar(0.92) dialect=egyptian(0.81) intent=rephrase(0.95)
     """
-    lang = detect_language(text)
-    dialect = detect_arabic_dialect(text) if lang == "ar" else None
-    intent = detect_intent(text, history)
+    lang, lang_conf = detect_language_with_confidence(text)
 
-    # ── Structured debug log ──
+    if lang == "ar":
+        dialect, dialect_conf = detect_arabic_dialect(text)
+    else:
+        dialect, dialect_conf = None, 0.0
+
+    intent, intent_conf = detect_intent(text, history)
+
+    # Structured production log
+    dialect_part = f"dialect={dialect}({dialect_conf:.2f}) " if dialect else ""
     logger.info(
-        f"[NLP] Pre-processing | language={lang!r} | dialect={dialect!r} | intent={intent!r}"
+        f"[NLP] lang={lang}({lang_conf:.2f}) "
+        f"{dialect_part}"
+        f"intent={intent}({intent_conf:.2f})"
     )
 
-    return NLPMetadata(language=lang, dialect=dialect, intent=intent)
+    return NLPMetadata(
+        language=lang, lang_confidence=lang_conf,
+        dialect=dialect, dialect_confidence=dialect_conf,
+        intent=intent, intent_confidence=intent_conf,
+    )
