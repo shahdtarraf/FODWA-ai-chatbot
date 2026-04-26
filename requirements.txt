@@ -14,6 +14,9 @@ numpy==1.26.2
 pyjwt==2.8.0
 python-dotenv==1.0.0
 
+# === NLP ===
+langdetect>=1.0.9
+
 # === Ingestion only (local) ===
 langchain-text-splitters==0.0.2
 PyMuPDF

@@ -5,11 +5,18 @@ Manages per-user conversation history (max 5 messages).
 
 Converted from async to sync for Django compatibility.
 All business logic is IDENTICAL to the FastAPI version.
+
+NLP Layer (added — non-breaking):
+  - Pre-processing via nlp_utils.preprocess() detects language, dialect, intent.
+  - Router: rephrase_request intent → bypass FAISS, use last assistant message.
+  - Dynamic instructions appended to BASE_SYSTEM_PROMPT per request.
+  - Post-processing via nlp_utils.post_process_response() fixes RTL + truncation.
 """
 
 import logging
 from chatbot.services.faiss_service import faiss_service
 from chatbot.services import openai_service
+from chatbot.utils.nlp_utils import preprocess, build_dynamic_system_prompt, post_process_response
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +29,9 @@ MAX_HISTORY = 5
 # Generic fallback response for system errors
 FALLBACK_RESPONSE = "عذراً، حدث خطأ في النظام ولا يمكننا معالجة طلبك حالياً. للتواصل مع الدعم:\nPhone: 00436763205041\nEmail: mohammed.kudjar@gmail.com"
 
-SYSTEM_PROMPT = """You are a professional AI assistant for the platform named "FODWA".
+# BASE_SYSTEM_PROMPT — never modified at runtime.
+# Dynamic per-request instructions are APPENDED by build_dynamic_system_prompt().
+BASE_SYSTEM_PROMPT = """You are a professional AI assistant for the platform named "FODWA".
 
 Your single most important responsibility is:
 👉 Responding to the user in the EXACT SAME language OR dialect they used.
@@ -145,9 +154,81 @@ def process_chat(message: str, user_id: str = "anonymous") -> str:
         user_id: User identifier from JWT.
 
     Returns:
-        String containing the bilingual Arabic/English response.
+        String containing the response in the user's language/dialect.
     """
     try:
+        history = _get_history(user_id)
+
+        # ── NLP Pre-processing ───────────────────────────────────────────────
+        # Runs BEFORE any FAISS or LLM call.
+        # Returns: NLPMetadata(language, dialect, intent)
+        nlp = preprocess(message, history)
+        logger.info(
+            f"[{user_id}] NLP | lang={nlp.language!r} "
+            f"dialect={nlp.dialect!r} intent={nlp.intent!r}"
+        )
+
+        # ── Router: Rephrase path ────────────────────────────────────────────
+        if nlp.intent == "rephrase_request":
+            logger.info(f"[{user_id}] Router → rephrase_request: bypassing FAISS entirely")
+
+            # Find the last assistant message from history
+            last_assistant_msg = None
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg["content"]
+                    break
+
+            if not last_assistant_msg:
+                # No prior assistant message — treat as new question instead
+                logger.warning(
+                    f"[{user_id}] rephrase_request but no prior assistant message. "
+                    "Falling back to new_question flow."
+                )
+                nlp.intent = "new_question"
+            else:
+                # Build rephrase-specific user content (no context, no FAISS)
+                user_prompt_content = (
+                    f"Previous answer to rephrase:\n{last_assistant_msg}\n\n"
+                    f"User request: {message}"
+                )
+
+                # Build dynamic system prompt (base + rephrase instructions)
+                dynamic_instructions = build_dynamic_system_prompt(
+                    lang=nlp.language,
+                    dialect=nlp.dialect,
+                    intent="rephrase_request",
+                )
+                full_system_content = BASE_SYSTEM_PROMPT + "\n\n" + dynamic_instructions
+
+                messages = [
+                    {"role": "system", "content": full_system_content},
+                    # No history injected for rephrase — keeps context minimal
+                    {"role": "user", "content": user_prompt_content},
+                ]
+
+                try:
+                    logger.info(f"[{user_id}] Sending rephrase payload to GPT-4o...")
+                    raw_response = openai_service.get_chat_response(messages)
+                except Exception as e:
+                    logger.error(f"[{user_id}] GPT-4o rephrase call failed: {e}")
+                    return FALLBACK_RESPONSE
+
+                # Post-processing
+                response = post_process_response(raw_response)
+
+                # Update history
+                _add_to_history(user_id, "user", message)
+                _add_to_history(user_id, "assistant", response)
+
+                logger.info(
+                    f"[{user_id}] Rephrase processed successfully: {len(response)} chars returned"
+                )
+                return response
+
+        # ── Router: New question path (default) ─────────────────────────────
+        logger.info(f"[{user_id}] Router → new_question: executing FAISS search")
+
         # Step 1: Get query embedding
         try:
             logger.info(f"[{user_id}] Generating embedding for user query...")
@@ -159,47 +240,57 @@ def process_chat(message: str, user_id: str = "anonymous") -> str:
         # Step 2: Search FAISS for relevant chunks
         logger.info(f"[{user_id}] Searching FAISS for relevant chunks (top_k=10)...")
         relevant_chunks = faiss_service.search(query_embedding, top_k=10)
-        
+
         # We always create context even if empty. The LLM can handle it intelligently.
         if relevant_chunks:
             context = "\n\n---\n\n".join(relevant_chunks)
-            logger.info(f"[{user_id}] Retrieved {len(relevant_chunks)} chunks. Context length: {len(context)} chars")
-            # Log a small preview of the context for debugging
+            logger.info(
+                f"[{user_id}] Retrieved {len(relevant_chunks)} chunks. "
+                f"Context length: {len(context)} chars"
+            )
             logger.debug(f"[{user_id}] Context preview: {context[:200]}...")
         else:
             logger.warning(f"[{user_id}] No relevant chunks found in FAISS.")
-            context = "لا تتوفر أي نصوص أو سياق إضافي للإجابة على هذا السؤال. / No additional context available."
+            context = (
+                "لا تتوفر أي نصوص أو سياق إضافي للإجابة على هذا السؤال. "
+                "/ No additional context available."
+            )
 
         # Step 3: Build user message incorporating the retrieved context
-        user_prompt_content = f"""Context / السياق:
-{context}
+        user_prompt_content = (
+            f"Context / السياق:\n{context}\n\n"
+            f"---\nUser Question / سؤال المستخدم:\n{message}"
+        )
 
----
-User Question / سؤال المستخدم:
-{message}"""
+        # Step 4: Build dynamic system prompt (base + new_question instructions)
+        dynamic_instructions = build_dynamic_system_prompt(
+            lang=nlp.language,
+            dialect=nlp.dialect,
+            intent="new_question",
+        )
+        full_system_content = BASE_SYSTEM_PROMPT + "\n\n" + dynamic_instructions
 
-        # Step 4: Build messages list (System -> History -> User)
-        system_message = {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        }
-
-        history = _get_history(user_id)
-
-        messages = [system_message] + history + [
+        # Step 5: Build messages list (System -> History -> User)
+        messages = [
+            {"role": "system", "content": full_system_content}
+        ] + history + [
             {"role": "user", "content": user_prompt_content}
         ]
 
-        # Step 5: Call GPT-4o
+        # Step 6: Call GPT-4o
         try:
             logger.info(f"[{user_id}] Sending payload to GPT-4o...")
-            response = openai_service.get_chat_response(messages)
+            raw_response = openai_service.get_chat_response(messages)
         except Exception as e:
             logger.error(f"[{user_id}] Failed to get chat response: {e}")
             return FALLBACK_RESPONSE
 
-        # Step 6: Update conversation history
-        # Note: We only add the strict user 'message' to history to prevent giant context from inflating token usage across turns
+        # Post-processing
+        response = post_process_response(raw_response)
+
+        # Step 7: Update conversation history
+        # Note: store only the raw user message (not the full context-injected prompt)
+        # to prevent token inflation across turns.
         _add_to_history(user_id, "user", message)
         _add_to_history(user_id, "assistant", response)
 
