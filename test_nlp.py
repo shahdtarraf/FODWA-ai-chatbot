@@ -230,6 +230,7 @@ def test_clean_text():
         ("Hello \u200eFODWA\u200e", "Hello FODWA"),
         ("مرحبا \u202bبكم\u202c", "مرحبا بكم"),
         ("Spaces    are\n\nnormalized", "Spaces are normalized"),
+        ("AWDOF is the platform", "FODWA is the platform"),
         ("", ""),
     ]
     for text, expected in cases:

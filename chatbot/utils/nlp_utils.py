@@ -414,6 +414,9 @@ def post_process_response(text: str) -> str:
     # Step 1: Clean hidden chars and spaces
     cleaned = clean_text(text)
 
+    # Step 1b: Fix reversed platform name without using Unicode markers
+    cleaned = re.sub(r'(?i)\bawdof\b', 'FODWA', cleaned)
+
     # Step 2: Sentence-based truncation
     sentences = _split_sentences(cleaned)
     if len(sentences) > _MAX_SENTENCES:

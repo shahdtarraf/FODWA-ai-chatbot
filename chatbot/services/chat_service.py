@@ -82,6 +82,20 @@ FORMATTING RULES
 - Ensure smooth sentence flow
 
 ━━━━━━━━━━━━━━━━━━
+PUNCTUATION & FORMAT
+━━━━━━━━━━━━━━━━━━
+- Avoid unnecessary quotation marks
+- Avoid escape characters like \" or \\ 
+- Do NOT wrap phrases with quotes unless absolutely necessary
+- Keep punctuation minimal and natural
+
+✔ Correct:
+يمكنك إنشاء حساب عن طريق الضغط على إنشاء حساب ثم إدخال بياناتك
+
+✘ Wrong:
+يمكنك إنشاء حساب عن طريق الضغط على زر "إنشاء حساب" ثم إدخال "المعلومات"
+
+━━━━━━━━━━━━━━━━━━
 STYLE
 ━━━━━━━━━━━━━━━━━━
 - Sound natural and human like a native speaker
