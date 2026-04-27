@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 # Constants
 # ──────────────────────────────────────────────
 
-_LRM = "\u200E"          # Left-to-Right Mark
 _MAX_SENTENCES = 3       # max sentences in truncated response
 _MAX_CHARS = 600         # hard character cap (safety net)
 
@@ -374,10 +373,7 @@ def build_dynamic_system_prompt(
 # 5. Post-processing  (sentence-aware truncation)
 # ──────────────────────────────────────────────
 
-_FODWA_PATTERN = re.compile(
-    r"(?<!\u200E)\b(FODWA|Fodwa|fodwa|AWDOF|awdof)\b(?!\u200E)",
-    re.IGNORECASE,
-)
+
 
 # Sentence boundary: ends with . ! ? … ؟ ؛ ، followed by space/newline/end
 _SENT_END = re.compile(r"[.!?…؟؛،]\s*")
@@ -396,39 +392,46 @@ def _split_sentences(text: str) -> list[str]:
     return [s for s in sentences if s.strip()]
 
 
+def clean_text(text: str) -> str:
+    """Strip hidden Unicode direction characters and normalize whitespace."""
+    if not text:
+        return text
+    text = re.sub(r'[\u200e\u200f\u202a-\u202e]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 def post_process_response(text: str) -> str:
     """
     Post-process LLM output:
-      1. Fix FODWA RTL bug (LRM markers).
+      1. Strip all hidden unicode directional markers + normalize spaces.
       2. Sentence-aware truncation to _MAX_SENTENCES.
       3. Hard character cap as safety net.
     """
     if not text:
         return text
 
-    # Step 1: FODWA RTL fix
-    fixed = _FODWA_PATTERN.sub(f"{_LRM}FODWA{_LRM}", text)
-    if fixed != text:
-        logger.debug("[NLP] post_process: FODWA RTL fix applied")
+    # Step 1: Clean hidden chars and spaces
+    cleaned = clean_text(text)
 
     # Step 2: Sentence-based truncation
-    sentences = _split_sentences(fixed)
+    sentences = _split_sentences(cleaned)
     if len(sentences) > _MAX_SENTENCES:
         logger.warning(
             f"[NLP] post_process: {len(sentences)} sentences → truncating to {_MAX_SENTENCES}"
         )
         kept = sentences[:_MAX_SENTENCES]
-        fixed = " ".join(kept)
-        last = fixed.rstrip()[-1] if fixed.rstrip() else ""
+        cleaned = " ".join(kept)
+        last = cleaned.rstrip()[-1] if cleaned.rstrip() else ""
         if last not in (".", "!", "?", "…", "،", "؟", "؛"):
-            fixed = fixed.rstrip() + "…"
+            cleaned = cleaned.rstrip() + "…"
 
     # Step 3: Hard char cap
-    if len(fixed) > _MAX_CHARS:
-        logger.warning(f"[NLP] post_process: {len(fixed)} chars → hard cap {_MAX_CHARS}")
-        fixed = fixed[:_MAX_CHARS].rstrip() + "…"
+    if len(cleaned) > _MAX_CHARS:
+        logger.warning(f"[NLP] post_process: {len(cleaned)} chars → hard cap {_MAX_CHARS}")
+        cleaned = cleaned[:_MAX_CHARS].rstrip() + "…"
 
-    return fixed
+    return cleaned
 
 
 # ──────────────────────────────────────────────

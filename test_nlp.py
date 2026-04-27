@@ -221,27 +221,20 @@ def test_build_prompt():
 
 
 # ═══════════════════════════════════════════════════════════
-# 5. post_process_response — FODWA RTL Fix
+# 5. post_process_response — clean_text
 # ═══════════════════════════════════════════════════════════
 
-def test_fodwa_rtl():
-    print("\n--- 5. FODWA RTL Fix ---")
-    LRM = "\u200E"
+def test_clean_text():
+    print("\n--- 5. Clean Text (No Hidden Unicode) ---")
     cases = [
-        ("FODWA is great",      True),
-        ("Use fodwa to post",   True),
-        ("AWDOF bug appears",   True),
-        ("No platform mention", False),
-        ("",                    False),
+        ("Hello \u200eFODWA\u200e", "Hello FODWA"),
+        ("مرحبا \u202bبكم\u202c", "مرحبا بكم"),
+        ("Spaces    are\n\nnormalized", "Spaces are normalized"),
+        ("", ""),
     ]
-    for text, expect_lrm in cases:
+    for text, expected in cases:
         result = post_process_response(text)
-        check(f"FODWA fix: {text!r}", (LRM in result) == expect_lrm, f"result={result!r}")
-
-    # Already wrapped → not double-wrapped
-    already = f"{LRM}FODWA{LRM} is great"
-    result2 = post_process_response(already)
-    check("Already-wrapped not double-wrapped", result2.count(LRM) == 2, f"count={result2.count(LRM)}")
+        check(f"Clean: {text!r}", result == expected, f"result={result!r}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -381,7 +374,7 @@ def run_all():
     test_intent_confidence()
     test_intent_long_text_not_rephrase()
     test_build_prompt()
-    test_fodwa_rtl()
+    test_clean_text()
     test_sentence_truncation()
     test_nlp_metadata()
     test_preprocess_pipeline()
